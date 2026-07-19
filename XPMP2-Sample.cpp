@@ -22,6 +22,8 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <ctime>
+#include <sys/stat.h>
 
 // X-Plane SDK
 #include "XPLMDataAccess.h"
@@ -45,12 +47,14 @@ namespace
 {
     constexpr double PI = 3.141592653589793238462643383279502884;
     constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.25f;
+    constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
 
     XPLMMenuID gMenu = nullptr;
 
     bool gMasterEnabled = true;
     bool gAircraftVisible = true;
     bool gFeedFilePreviouslyMissing = false;
+    bool gFeedFilePreviouslyStale = false;
 
     XPLMDataRef gLocalX = nullptr;
     XPLMDataRef gLocalY = nullptr;
@@ -70,6 +74,7 @@ namespace
     {
         bool feedEnabled = true;
         bool worldMode = false;
+        bool onGround = false;
 
         std::string icaoType = "A319";
         std::string airline = "BAW";
@@ -283,6 +288,37 @@ namespace
         return position;
     }
 
+    bool IsTrafficFileFresh()
+    {
+#ifdef _WIN32
+        struct _stat64 fileInformation = {};
+
+        if (_stat64(
+                gTrafficFilePath.c_str(),
+                &fileInformation) != 0)
+        {
+            return false;
+        }
+#else
+        struct stat fileInformation = {};
+
+        if (stat(
+                gTrafficFilePath.c_str(),
+                &fileInformation) != 0)
+        {
+            return false;
+        }
+#endif
+
+        const std::time_t currentTime = std::time(nullptr);
+        const double ageSeconds =
+            std::difftime(
+                currentTime,
+                fileInformation.st_mtime);
+
+        return ageSeconds <= TRAFFIC_FEED_TIMEOUT_SECONDS;
+    }
+
     int PreferencesCallback(
         const char*,
         const char* item,
@@ -313,6 +349,7 @@ public:
         XPMPPlaneID modeSId)
         : Aircraft(icaoType, airline, livery, modeSId)
     {
+        bClampToGround = true;
         ApplyIdentity(gTrafficState);
     }
 
@@ -358,7 +395,7 @@ public:
                 state.latitude,
                 state.longitude,
                 state.altitudeFeet,
-                false);
+                state.onGround);
 
             SetHeading(NormaliseHeading(state.headingDegrees));
         }
@@ -383,7 +420,7 @@ public:
                 latitude,
                 longitude,
                 elevationMetres / M_per_FT,
-                false);
+                state.onGround);
 
             SetHeading(
                 NormaliseHeading(
@@ -422,7 +459,7 @@ public:
 
         SetThrustReversRatio(0.0f);
         SetReversDeployRatio(0.0f);
-        SetTouchDown(false);
+        SetTouchDown(state.onGround);
     }
 };
 
@@ -577,6 +614,27 @@ namespace
             gFeedFilePreviouslyMissing = false;
         }
 
+        if (!IsTrafficFileFresh())
+        {
+            if (!gFeedFilePreviouslyStale)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Feed is stale; removing aircraft until AeroPath resumes updates");
+
+                gFeedFilePreviouslyStale = true;
+            }
+
+            return false;
+        }
+
+        if (gFeedFilePreviouslyStale)
+        {
+            LogMessage(
+                "AeroPath Traffic: Live feed updates resumed");
+
+            gFeedFilePreviouslyStale = false;
+        }
+
         parsedState = gTrafficState;
 
         std::string line;
@@ -608,6 +666,10 @@ namespace
             else if (key == "mode")
                 parsedState.worldMode =
                     ToLower(value) == "world";
+
+            else if (key == "on_ground")
+                parsedState.onGround =
+                    ParseBool(value, parsedState.onGround);
 
             else if (key == "icao")
                 parsedState.icaoType = value;
