@@ -3,7 +3,7 @@
 /// @details    Renders multiple AeroPath-controlled aircraft through XPMP2 and
 ///             reads their states from Resources/AeroPathTraffic.txt.
 ///
-///             Feed version 2 uses repeated [aircraft] blocks. The original
+///             Feed version 3 uses repeated [aircraft] blocks and explicit aircraft/operator/livery identity. The original
 ///             single-aircraft key/value feed remains supported so existing
 ///             development installations continue to work while the AeroPath
 ///             desktop writer is upgraded.
@@ -85,7 +85,10 @@ namespace
         std::string uniqueId;
         std::string icaoType = "C172";
         std::string airline;
+        std::string airlineName;
         std::string livery;
+        std::string registration;
+        std::string flightNumber;
         std::string callsign = "AEROPATH";
 
         // Relative mode remains available for local development.
@@ -435,6 +438,7 @@ public:
           state_(initialState)
     {
         bClampToGround = true;
+        EnforceDeterministicModelPolicy();
         ApplyIdentity(state_);
     }
 
@@ -452,6 +456,9 @@ public:
 
         const bool identityChanged =
             modelChanged ||
+            state_.airlineName != nextState.airlineName ||
+            state_.registration != nextState.registration ||
+            state_.flightNumber != nextState.flightNumber ||
             state_.callsign != nextState.callsign ||
             state_.uniqueId != nextState.uniqueId;
 
@@ -463,6 +470,8 @@ public:
                 state_.icaoType,
                 state_.airline,
                 state_.livery);
+
+            EnforceDeterministicModelPolicy();
         }
 
         if (identityChanged)
@@ -491,19 +500,190 @@ public:
             sizeof(acInfoTexts.icaoAirline));
 
         SafeCopy(
+            acInfoTexts.airline,
+            state.airlineName.c_str(),
+            sizeof(acInfoTexts.airline));
+
+        const std::string flightNumber =
+            state.flightNumber.empty()
+                ? state.callsign
+                : state.flightNumber;
+
+        SafeCopy(
             acInfoTexts.flightNum,
-            state.callsign.c_str(),
+            flightNumber.c_str(),
             sizeof(acInfoTexts.flightNum));
 
         const std::string tailNumber =
-            state.uniqueId.empty()
-                ? "AP-REMOTE"
-                : state.uniqueId;
+            state.registration.empty()
+                ? (state.uniqueId.empty()
+                    ? "AP-REMOTE"
+                    : state.uniqueId)
+                : state.registration;
 
         SafeCopy(
             acInfoTexts.tailNum,
             tailNumber.c_str(),
             sizeof(acInfoTexts.tailNum));
+    }
+
+    void EnforceDeterministicModelPolicy()
+    {
+        constexpr int MAXIMUM_RELATED_FAMILY_QUALITY = 15;
+
+        const auto sameCode = [](
+            const std::string& first,
+            const std::string& second)
+        {
+            return ToUpper(Trim(first)) ==
+                   ToUpper(Trim(second));
+        };
+
+        const auto modelSupportsAirline = [&sameCode](
+            const CSLModelInfo_t& modelInfo,
+            const std::string& requestedAirline)
+        {
+            if (Trim(requestedAirline).empty())
+                return true;
+
+            for (const CSLModelInfo_t::MatchCrit_t& criterion :
+                 modelInfo.vecMatchCrit)
+            {
+                if (sameCode(
+                        criterion.icaoAirline,
+                        requestedAirline))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        const auto modelAirlineForLog = [&sameCode](
+            const CSLModelInfo_t& modelInfo,
+            const std::string& requestedAirline)
+        {
+            for (const CSLModelInfo_t::MatchCrit_t& criterion :
+                 modelInfo.vecMatchCrit)
+            {
+                if (!Trim(requestedAirline).empty() &&
+                    sameCode(
+                        criterion.icaoAirline,
+                        requestedAirline))
+                {
+                    return ToUpper(
+                        Trim(criterion.icaoAirline));
+                }
+            }
+
+            for (const CSLModelInfo_t::MatchCrit_t& criterion :
+                 modelInfo.vecMatchCrit)
+            {
+                const std::string airline =
+                    ToUpper(Trim(criterion.icaoAirline));
+
+                if (!airline.empty())
+                    return airline;
+            }
+
+            return std::string{};
+        };
+
+        CSLModelInfo_t modelInfo = GetModelInfo();
+        int selectedMatchQuality = GetMatchQuality();
+
+        const bool exactAircraft =
+            sameCode(modelInfo.icaoType, state_.icaoType);
+
+        const bool matchingAirline =
+            modelSupportsAirline(
+                modelInfo,
+                state_.airline);
+
+        std::string selectedModelAirline =
+            modelAirlineForLog(
+                modelInfo,
+                state_.airline);
+
+        if (exactAircraft ||
+            (matchingAirline &&
+             selectedMatchQuality >= 0 &&
+             selectedMatchQuality <= MAXIMUM_RELATED_FAMILY_QUALITY))
+        {
+            SetRender(true);
+
+            LogMessage(
+                "AeroPath Traffic: Deterministic match accepted for '%s': requested %s/%s/%s -> %s/%s using '%s' (quality %d)",
+                state_.callsign.c_str(),
+                state_.icaoType.c_str(),
+                state_.airline.c_str(),
+                state_.livery.c_str(),
+                modelInfo.icaoType.c_str(),
+                selectedModelAirline.c_str(),
+                modelInfo.modelName.c_str(),
+                selectedMatchQuality);
+
+            return;
+        }
+
+        /*
+         * XPMP2 normally prefers a related aircraft carrying the requested
+         * airline livery over an exact aircraft type with the wrong livery.
+         * AeroPath intentionally reverses that trade-off: aircraft shape and
+         * family come first, then airline/livery. Re-run matching without the
+         * operator inputs so an installed exact type cannot be displaced by an
+         * unrelated aircraft merely because it has the requested paint.
+         */
+        selectedMatchQuality = ChangeModel(
+            state_.icaoType,
+            "",
+            "");
+
+        modelInfo = GetModelInfo();
+        selectedModelAirline =
+            modelAirlineForLog(
+                modelInfo,
+                state_.airline);
+
+        const bool fallbackExactAircraft =
+            sameCode(modelInfo.icaoType, state_.icaoType);
+
+        const bool acceptableRelatedFamily =
+            selectedMatchQuality >= 0 &&
+            selectedMatchQuality <= MAXIMUM_RELATED_FAMILY_QUALITY;
+
+        if (fallbackExactAircraft || acceptableRelatedFamily)
+        {
+            SetRender(true);
+
+            LogMessage(
+                "AeroPath Traffic: Type-first fallback accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)",
+                state_.callsign.c_str(),
+                state_.icaoType.c_str(),
+                state_.airline.c_str(),
+                modelInfo.icaoType.c_str(),
+                selectedModelAirline.c_str(),
+                modelInfo.modelName.c_str(),
+                selectedMatchQuality);
+
+            return;
+        }
+
+        /*
+         * A badly unrelated model is worse than no 3D model. Keep the target
+         * available to TCAS/interfaces but suppress the random visual model.
+         */
+        SetRender(false);
+
+        LogMessage(
+            "AeroPath Traffic: No acceptable model for '%s' (%s/%s). Rejected '%s' type %s quality %d; 3D rendering suppressed",
+            state_.callsign.c_str(),
+            state_.icaoType.c_str(),
+            state_.airline.c_str(),
+            modelInfo.modelName.c_str(),
+            modelInfo.icaoType.c_str(),
+            selectedMatchQuality);
     }
 
     void UpdatePosition(float, int) override
@@ -743,11 +923,20 @@ namespace
         else if (key == "airline")
             state.airline = ToUpper(value);
 
+        else if (key == "airline_name")
+            state.airlineName = value;
+
         else if (key == "livery")
-            state.livery = value;
+            state.livery = ToUpper(value);
+
+        else if (key == "registration")
+            state.registration = ToUpper(value);
+
+        else if (key == "flight_number")
+            state.flightNumber = ToUpper(value);
 
         else if (key == "callsign")
-            state.callsign = value;
+            state.callsign = ToUpper(value);
 
         else if (key == "forward_m")
             state.forwardMetres =
@@ -836,16 +1025,24 @@ namespace
         state.callsign = Trim(state.callsign);
         state.icaoType = ToUpper(Trim(state.icaoType));
         state.airline = ToUpper(Trim(state.airline));
-        state.livery = Trim(state.livery);
+        state.airlineName = Trim(state.airlineName);
+        state.livery = ToUpper(Trim(state.livery));
+        state.registration = ToUpper(Trim(state.registration));
+        state.flightNumber = ToUpper(Trim(state.flightNumber));
 
         if (state.icaoType.empty())
             state.icaoType = "C172";
 
+        if (state.flightNumber.empty())
+            state.flightNumber = state.callsign;
+
         if (state.callsign.empty())
             state.callsign =
-                state.uniqueId.empty()
-                    ? "AEROPATH"
-                    : state.uniqueId;
+                !state.flightNumber.empty()
+                    ? state.flightNumber
+                    : state.uniqueId.empty()
+                        ? "AEROPATH"
+                        : state.uniqueId;
 
         const std::string key =
             BuildTrafficKey(state, fallbackIndex);
@@ -1118,10 +1315,11 @@ namespace
                 if (modelChanged)
                 {
                     LogMessage(
-                        "AeroPath Traffic: Model request for '%s' changed to %s/%s",
+                        "AeroPath Traffic: Model request for '%s' changed to %s/%s/%s",
                         state.callsign.c_str(),
                         state.icaoType.c_str(),
-                        state.airline.c_str());
+                        state.airline.c_str(),
+                        state.livery.c_str());
                 }
             }
             catch (const XPMP2::XPMP2Error& exception)
