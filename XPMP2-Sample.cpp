@@ -1,14 +1,12 @@
 /// @file       XPMP2-Sample.cpp
-/// @brief      AeroPath Traffic - external traffic feed development build
-/// @details    Renders one AeroPath-controlled aircraft through XPMP2 and reads
-///             its state from Resources/AeroPathTraffic.txt.
+/// @brief      AeroPath Traffic - multi-aircraft external traffic feed
+/// @details    Renders multiple AeroPath-controlled aircraft through XPMP2 and
+///             reads their states from Resources/AeroPathTraffic.txt.
 ///
-///             Supported feed modes:
-///             - relative: forward/right/up offsets from the user's aircraft
-///             - world:    absolute latitude/longitude/altitude coordinates
-///
-///             This is the first local bridge between AeroPath data and the
-///             X-Plane multiplayer renderer.
+///             Feed version 2 uses repeated [aircraft] blocks. The original
+///             single-aircraft key/value feed remains supported so existing
+///             development installations continue to work while the AeroPath
+///             desktop writer is upgraded.
 ///
 /// @copyright  Based on the XPMP2-Sample project:
 ///             Copyright (c) 2020 Birger Hoppe
@@ -23,6 +21,11 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <cstdint>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <sys/stat.h>
 
 // X-Plane SDK
@@ -48,11 +51,13 @@ namespace
     constexpr double PI = 3.141592653589793238462643383279502884;
     constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.25f;
     constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
+    constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
 
     XPLMMenuID gMenu = nullptr;
 
     bool gMasterEnabled = true;
     bool gAircraftVisible = true;
+    bool gFeedEnabled = true;
     bool gFeedFilePreviouslyMissing = false;
     bool gFeedFilePreviouslyStale = false;
 
@@ -62,6 +67,7 @@ namespace
     XPLMDataRef gHeading = nullptr;
 
     std::string gTrafficFilePath;
+    std::size_t gLastReportedTrafficCount = static_cast<std::size_t>(-1);
 
     struct LocalPosition
     {
@@ -73,27 +79,28 @@ namespace
     struct TrafficState
     {
         bool feedEnabled = true;
-        bool worldMode = false;
+        bool worldMode = true;
         bool onGround = false;
 
-        std::string icaoType = "A319";
-        std::string airline = "BAW";
+        std::string uniqueId;
+        std::string icaoType = "C172";
+        std::string airline;
         std::string livery;
-        std::string callsign = "AEROPATH TEST";
+        std::string callsign = "AEROPATH";
 
-        // Relative mode
+        // Relative mode remains available for local development.
         float forwardMetres = 300.0f;
         float rightMetres = 80.0f;
         float upMetres = 40.0f;
         float headingOffsetDegrees = 0.0f;
 
-        // World mode
+        // World mode.
         double latitude = 0.0;
         double longitude = 0.0;
         double altitudeFeet = 0.0;
         float headingDegrees = 0.0f;
 
-        // Shared attitude and aircraft configuration
+        // Shared attitude and aircraft configuration.
         float pitchDegrees = 0.0f;
         float rollDegrees = 0.0f;
         float gearRatio = 0.0f;
@@ -107,7 +114,11 @@ namespace
         bool navLight = true;
     };
 
-    TrafficState gTrafficState;
+    struct ParsedTrafficFeed
+    {
+        bool enabled = true;
+        std::unordered_map<std::string, TrafficState> aircraft;
+    };
 
     enum MenuItem
     {
@@ -171,6 +182,20 @@ namespace
         return value;
     }
 
+    std::string ToUpper(std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char character)
+            {
+                return static_cast<char>(std::toupper(character));
+            });
+
+        return value;
+    }
+
     bool ParseBool(const std::string& value, const bool currentValue)
     {
         const std::string normalised = ToLower(Trim(value));
@@ -201,7 +226,7 @@ namespace
             std::size_t parsedCharacters = 0;
             const float parsedValue = std::stof(Trim(value), &parsedCharacters);
 
-            if (parsedCharacters == 0)
+            if (parsedCharacters == 0 || !std::isfinite(parsedValue))
                 return currentValue;
 
             return parsedValue;
@@ -219,7 +244,7 @@ namespace
             std::size_t parsedCharacters = 0;
             const double parsedValue = std::stod(Trim(value), &parsedCharacters);
 
-            if (parsedCharacters == 0)
+            if (parsedCharacters == 0 || !std::isfinite(parsedValue))
                 return currentValue;
 
             return parsedValue;
@@ -258,6 +283,26 @@ namespace
         return destination;
     }
 
+    bool IsValidWorldPosition(const TrafficState& state)
+    {
+        if (!std::isfinite(state.latitude) ||
+            !std::isfinite(state.longitude) ||
+            !std::isfinite(state.altitudeFeet))
+        {
+            return false;
+        }
+
+        if (state.latitude < -90.0 || state.latitude > 90.0 ||
+            state.longitude < -180.0 || state.longitude > 180.0)
+        {
+            return false;
+        }
+
+        return
+            std::abs(state.latitude) >= 0.0001 ||
+            std::abs(state.longitude) >= 0.0001;
+    }
+
     LocalPosition CalculateRelativePosition(const TrafficState& state)
     {
         LocalPosition position
@@ -270,14 +315,12 @@ namespace
         const double headingRadians =
             DegreesToRadians(XPLMGetDataf(gHeading));
 
-        // Forward vector in X-Plane's local coordinate system.
         position.x +=
             std::sin(headingRadians) * state.forwardMetres;
 
         position.z -=
             std::cos(headingRadians) * state.forwardMetres;
 
-        // Right vector, perpendicular to the forward vector.
         position.x +=
             std::cos(headingRadians) * state.rightMetres;
 
@@ -316,7 +359,46 @@ namespace
                 currentTime,
                 fileInformation.st_mtime);
 
-        return ageSeconds <= TRAFFIC_FEED_TIMEOUT_SECONDS;
+        return
+            ageSeconds >= -5.0 &&
+            ageSeconds <= TRAFFIC_FEED_TIMEOUT_SECONDS;
+    }
+
+    std::string BuildTrafficKey(
+        const TrafficState& state,
+        const std::size_t fallbackIndex)
+    {
+        std::string key = Trim(state.uniqueId);
+
+        if (key.empty())
+            key = Trim(state.callsign);
+
+        if (key.empty())
+            key = "AEROPATH-" + std::to_string(fallbackIndex + 1);
+
+        return ToUpper(key);
+    }
+
+    XPMPPlaneID BuildModeSId(const std::string& trafficKey)
+    {
+        std::uint32_t hash = 2166136261u;
+
+        for (const unsigned char character : trafficKey)
+        {
+            hash ^= character;
+            hash *= 16777619u;
+        }
+
+        // Use an AeroPath-owned development range within the 24-bit Mode-S
+        // value. This is only an internal XPMP identifier.
+        std::uint32_t modeSId =
+            0xA00000u |
+            (hash & 0x0FFFFFu);
+
+        if (modeSId == 0)
+            modeSId = 0xA00001u;
+
+        return static_cast<XPMPPlaneID>(modeSId);
     }
 
     int PreferencesCallback(
@@ -343,14 +425,48 @@ class AeroPathAircraft final : public XPMP2::Aircraft
 {
 public:
     AeroPathAircraft(
-        const std::string& icaoType,
-        const std::string& airline,
-        const std::string& livery,
+        const TrafficState& initialState,
         XPMPPlaneID modeSId)
-        : Aircraft(icaoType, airline, livery, modeSId)
+        : Aircraft(
+            initialState.icaoType,
+            initialState.airline,
+            initialState.livery,
+            modeSId),
+          state_(initialState)
     {
         bClampToGround = true;
-        ApplyIdentity(gTrafficState);
+        ApplyIdentity(state_);
+    }
+
+    const TrafficState& State() const
+    {
+        return state_;
+    }
+
+    void ApplyState(const TrafficState& nextState)
+    {
+        const bool modelChanged =
+            state_.icaoType != nextState.icaoType ||
+            state_.airline != nextState.airline ||
+            state_.livery != nextState.livery;
+
+        const bool identityChanged =
+            modelChanged ||
+            state_.callsign != nextState.callsign ||
+            state_.uniqueId != nextState.uniqueId;
+
+        state_ = nextState;
+
+        if (modelChanged)
+        {
+            ChangeModel(
+                state_.icaoType,
+                state_.airline,
+                state_.livery);
+        }
+
+        if (identityChanged)
+            ApplyIdentity(state_);
     }
 
     void ApplyIdentity(const TrafficState& state)
@@ -379,15 +495,20 @@ public:
             state.callsign.c_str(),
             sizeof(acInfoTexts.flightNum));
 
+        const std::string tailNumber =
+            state.uniqueId.empty()
+                ? "AP-REMOTE"
+                : state.uniqueId;
+
         SafeCopy(
             acInfoTexts.tailNum,
-            "AP-REMOTE",
+            tailNumber.c_str(),
             sizeof(acInfoTexts.tailNum));
     }
 
     void UpdatePosition(float, int) override
     {
-        const TrafficState state = gTrafficState;
+        const TrafficState state = state_;
 
         if (state.worldMode)
         {
@@ -397,7 +518,8 @@ public:
                 state.altitudeFeet,
                 state.onGround);
 
-            SetHeading(NormaliseHeading(state.headingDegrees));
+            SetHeading(
+                NormaliseHeading(state.headingDegrees));
         }
         else
         {
@@ -461,22 +583,22 @@ public:
         SetReversDeployRatio(0.0f);
         SetTouchDown(state.onGround);
     }
+
+private:
+    TrafficState state_;
 };
 
 namespace
 {
-    AeroPathAircraft* gRemoteAircraft = nullptr;
-
-    bool IsAircraftCreated()
-    {
-        return gRemoteAircraft != nullptr;
-    }
+    std::unordered_map<
+        std::string,
+        std::unique_ptr<AeroPathAircraft>> gRemoteAircraft;
 
     bool ShouldRenderTraffic()
     {
         return
             gMasterEnabled &&
-            gTrafficState.feedEnabled;
+            gFeedEnabled;
     }
 
     void UpdateMenuCheckmarks()
@@ -506,89 +628,245 @@ namespace
                 : xplm_Menu_Unchecked);
     }
 
-    void CreateAircraft()
+    void RemoveAircraft(const std::string& key)
     {
-        if (!ShouldRenderTraffic() || gRemoteAircraft)
+        const auto iterator =
+            gRemoteAircraft.find(key);
+
+        if (iterator == gRemoteAircraft.end())
             return;
+
+        const std::string callsign =
+            iterator->second
+                ? iterator->second->State().callsign
+                : key;
+
+        gRemoteAircraft.erase(iterator);
+
+        LogMessage(
+            "AeroPath Traffic: Removed remote aircraft '%s'",
+            callsign.c_str());
+    }
+
+    void RemoveAllAircraft()
+    {
+        if (gRemoteAircraft.empty())
+            return;
+
+        const std::size_t removedCount =
+            gRemoteAircraft.size();
+
+        gRemoteAircraft.clear();
+
+        LogMessage(
+            "AeroPath Traffic: Removed %zu remote aircraft",
+            removedCount);
+
+        gLastReportedTrafficCount = 0;
+        UpdateMenuCheckmarks();
+    }
+
+    void CreateAircraft(
+        const std::string& key,
+        const TrafficState& state)
+    {
+        if (!ShouldRenderTraffic() ||
+            gRemoteAircraft.find(key) != gRemoteAircraft.end())
+        {
+            return;
+        }
 
         try
         {
-            gRemoteAircraft = new AeroPathAircraft(
-                gTrafficState.icaoType,
-                gTrafficState.airline,
-                gTrafficState.livery,
-                0xAE0001);
+            auto aircraft =
+                std::make_unique<AeroPathAircraft>(
+                    state,
+                    BuildModeSId(key));
 
-            gRemoteAircraft->SetVisible(gAircraftVisible);
+            aircraft->SetVisible(gAircraftVisible);
 
             const XPMP2::CSLModelInfo_t modelInfo =
-                gRemoteAircraft->GetModelInfo();
+                aircraft->GetModelInfo();
 
             LogMessage(
                 "AeroPath Traffic: Created %s/%s callsign '%s' using CSL model '%s'",
-                gTrafficState.icaoType.c_str(),
-                gTrafficState.airline.c_str(),
-                gTrafficState.callsign.c_str(),
+                state.icaoType.c_str(),
+                state.airline.c_str(),
+                state.callsign.c_str(),
                 modelInfo.modelName.c_str());
+
+            gRemoteAircraft.emplace(
+                key,
+                std::move(aircraft));
         }
         catch (const XPMP2::XPMP2Error& exception)
         {
             LogMessage(
-                "AeroPath Traffic: Could not create remote aircraft: %s",
+                "AeroPath Traffic: Could not create remote aircraft '%s': %s",
+                state.callsign.c_str(),
                 exception.what());
-
-            delete gRemoteAircraft;
-            gRemoteAircraft = nullptr;
         }
-
-        UpdateMenuCheckmarks();
-    }
-
-    void RemoveAircraft()
-    {
-        if (!gRemoteAircraft)
-            return;
-
-        delete gRemoteAircraft;
-        gRemoteAircraft = nullptr;
-
-        LogMessage("AeroPath Traffic: Remote aircraft removed");
-        UpdateMenuCheckmarks();
-    }
-
-    void ApplyAircraftIdentity(
-        const TrafficState& previousState,
-        const TrafficState& newState)
-    {
-        if (!gRemoteAircraft)
-            return;
-
-        const bool modelChanged =
-            previousState.icaoType != newState.icaoType ||
-            previousState.airline != newState.airline ||
-            previousState.livery != newState.livery;
-
-        if (modelChanged)
+        catch (const std::exception& exception)
         {
-            gRemoteAircraft->ChangeModel(
-                newState.icaoType,
-                newState.airline,
-                newState.livery);
-
             LogMessage(
-                "AeroPath Traffic: Model request changed to %s/%s",
-                newState.icaoType.c_str(),
-                newState.airline.c_str());
-        }
-
-        if (modelChanged ||
-            previousState.callsign != newState.callsign)
-        {
-            gRemoteAircraft->ApplyIdentity(newState);
+                "AeroPath Traffic: Could not create remote aircraft '%s': %s",
+                state.callsign.c_str(),
+                exception.what());
         }
     }
 
-    bool ReadTrafficFile(TrafficState& parsedState)
+    void ApplyStateValue(
+        TrafficState& state,
+        const std::string& key,
+        const std::string& value)
+    {
+        if (key == "enabled")
+            state.feedEnabled =
+                ParseBool(value, state.feedEnabled);
+
+        else if (key == "id" ||
+                 key == "pilot_id" ||
+                 key == "traffic_id")
+            state.uniqueId = value;
+
+        else if (key == "mode")
+            state.worldMode =
+                ToLower(value) == "world";
+
+        else if (key == "on_ground")
+            state.onGround =
+                ParseBool(value, state.onGround);
+
+        else if (key == "icao")
+            state.icaoType = ToUpper(value);
+
+        else if (key == "airline")
+            state.airline = ToUpper(value);
+
+        else if (key == "livery")
+            state.livery = value;
+
+        else if (key == "callsign")
+            state.callsign = value;
+
+        else if (key == "forward_m")
+            state.forwardMetres =
+                ParseFloat(value, state.forwardMetres);
+
+        else if (key == "right_m")
+            state.rightMetres =
+                ParseFloat(value, state.rightMetres);
+
+        else if (key == "up_m")
+            state.upMetres =
+                ParseFloat(value, state.upMetres);
+
+        else if (key == "heading_offset_deg")
+            state.headingOffsetDegrees =
+                ParseFloat(
+                    value,
+                    state.headingOffsetDegrees);
+
+        else if (key == "latitude")
+            state.latitude =
+                ParseDouble(value, state.latitude);
+
+        else if (key == "longitude")
+            state.longitude =
+                ParseDouble(value, state.longitude);
+
+        else if (key == "altitude_ft")
+            state.altitudeFeet =
+                ParseDouble(value, state.altitudeFeet);
+
+        else if (key == "heading")
+            state.headingDegrees =
+                ParseFloat(value, state.headingDegrees);
+
+        else if (key == "pitch")
+            state.pitchDegrees =
+                ParseFloat(value, state.pitchDegrees);
+
+        else if (key == "roll")
+            state.rollDegrees =
+                ParseFloat(value, state.rollDegrees);
+
+        else if (key == "gear")
+            state.gearRatio =
+                ParseFloat(value, state.gearRatio);
+
+        else if (key == "flaps")
+            state.flapRatio =
+                ParseFloat(value, state.flapRatio);
+
+        else if (key == "thrust")
+            state.thrustRatio =
+                ParseFloat(value, state.thrustRatio);
+
+        else if (key == "taxi_light")
+            state.taxiLight =
+                ParseBool(value, state.taxiLight);
+
+        else if (key == "landing_light")
+            state.landingLight =
+                ParseBool(value, state.landingLight);
+
+        else if (key == "beacon_light")
+            state.beaconLight =
+                ParseBool(value, state.beaconLight);
+
+        else if (key == "strobe_light")
+            state.strobeLight =
+                ParseBool(value, state.strobeLight);
+
+        else if (key == "nav_light")
+            state.navLight =
+                ParseBool(value, state.navLight);
+    }
+
+    void AddParsedAircraft(
+        ParsedTrafficFeed& parsedFeed,
+        TrafficState state,
+        const std::size_t fallbackIndex)
+    {
+        if (!state.feedEnabled)
+            return;
+
+        state.uniqueId = Trim(state.uniqueId);
+        state.callsign = Trim(state.callsign);
+        state.icaoType = ToUpper(Trim(state.icaoType));
+        state.airline = ToUpper(Trim(state.airline));
+        state.livery = Trim(state.livery);
+
+        if (state.icaoType.empty())
+            state.icaoType = "C172";
+
+        if (state.callsign.empty())
+            state.callsign =
+                state.uniqueId.empty()
+                    ? "AEROPATH"
+                    : state.uniqueId;
+
+        const std::string key =
+            BuildTrafficKey(state, fallbackIndex);
+
+        if (state.uniqueId.empty())
+            state.uniqueId = key;
+
+        if (state.worldMode &&
+            !IsValidWorldPosition(state))
+        {
+            LogMessage(
+                "AeroPath Traffic: Ignoring '%s' because its world position is invalid",
+                state.callsign.c_str());
+
+            return;
+        }
+
+        parsedFeed.aircraft[key] = state;
+    }
+
+    bool ReadTrafficFile(ParsedTrafficFeed& parsedFeed)
     {
         std::ifstream input(gTrafficFilePath);
 
@@ -635,9 +913,18 @@ namespace
             gFeedFilePreviouslyStale = false;
         }
 
-        parsedState = gTrafficState;
+        parsedFeed = ParsedTrafficFeed{};
 
+        bool insideAircraftBlock = false;
+        bool currentBlockHasValues = false;
+        bool legacyStateHasValues = false;
+
+        TrafficState currentBlockState;
+        TrafficState legacyState;
+
+        std::size_t parsedIndex = 0;
         std::string line;
+
         while (std::getline(input, line))
         {
             line = Trim(line);
@@ -649,151 +936,236 @@ namespace
                 continue;
             }
 
-            const std::size_t equalsPosition = line.find('=');
+            const std::string lowerLine =
+                ToLower(line);
+
+            if (lowerLine == "[aircraft]")
+            {
+                if (insideAircraftBlock &&
+                    currentBlockHasValues &&
+                    parsedFeed.aircraft.size() < MAX_REMOTE_AIRCRAFT)
+                {
+                    AddParsedAircraft(
+                        parsedFeed,
+                        currentBlockState,
+                        parsedIndex++);
+                }
+
+                insideAircraftBlock = true;
+                currentBlockHasValues = false;
+                currentBlockState = TrafficState{};
+                currentBlockState.worldMode = true;
+                continue;
+            }
+
+            if (lowerLine == "[/aircraft]")
+            {
+                if (insideAircraftBlock &&
+                    currentBlockHasValues &&
+                    parsedFeed.aircraft.size() < MAX_REMOTE_AIRCRAFT)
+                {
+                    AddParsedAircraft(
+                        parsedFeed,
+                        currentBlockState,
+                        parsedIndex++);
+                }
+
+                insideAircraftBlock = false;
+                currentBlockHasValues = false;
+                currentBlockState = TrafficState{};
+                continue;
+            }
+
+            const std::size_t equalsPosition =
+                line.find('=');
+
             if (equalsPosition == std::string::npos)
                 continue;
 
             const std::string key =
-                ToLower(Trim(line.substr(0, equalsPosition)));
+                ToLower(
+                    Trim(
+                        line.substr(
+                            0,
+                            equalsPosition)));
 
             const std::string value =
-                Trim(line.substr(equalsPosition + 1));
+                Trim(
+                    line.substr(
+                        equalsPosition + 1));
 
-            if (key == "enabled")
-                parsedState.feedEnabled =
-                    ParseBool(value, parsedState.feedEnabled);
-
-            else if (key == "mode")
-                parsedState.worldMode =
-                    ToLower(value) == "world";
-
-            else if (key == "on_ground")
-                parsedState.onGround =
-                    ParseBool(value, parsedState.onGround);
-
-            else if (key == "icao")
-                parsedState.icaoType = value;
-
-            else if (key == "airline")
-                parsedState.airline = value;
-
-            else if (key == "livery")
-                parsedState.livery = value;
-
-            else if (key == "callsign")
-                parsedState.callsign = value;
-
-            else if (key == "forward_m")
-                parsedState.forwardMetres =
-                    ParseFloat(value, parsedState.forwardMetres);
-
-            else if (key == "right_m")
-                parsedState.rightMetres =
-                    ParseFloat(value, parsedState.rightMetres);
-
-            else if (key == "up_m")
-                parsedState.upMetres =
-                    ParseFloat(value, parsedState.upMetres);
-
-            else if (key == "heading_offset_deg")
-                parsedState.headingOffsetDegrees =
-                    ParseFloat(
+            if (!insideAircraftBlock &&
+                key == "enabled")
+            {
+                parsedFeed.enabled =
+                    ParseBool(
                         value,
-                        parsedState.headingOffsetDegrees);
+                        parsedFeed.enabled);
 
-            else if (key == "latitude")
-                parsedState.latitude =
-                    ParseDouble(value, parsedState.latitude);
+                continue;
+            }
 
-            else if (key == "longitude")
-                parsedState.longitude =
-                    ParseDouble(value, parsedState.longitude);
+            if (!insideAircraftBlock &&
+                (key == "version" ||
+                 key == "count" ||
+                 key == "generated_at"))
+            {
+                continue;
+            }
 
-            else if (key == "altitude_ft")
-                parsedState.altitudeFeet =
-                    ParseDouble(value, parsedState.altitudeFeet);
+            if (insideAircraftBlock)
+            {
+                ApplyStateValue(
+                    currentBlockState,
+                    key,
+                    value);
 
-            else if (key == "heading")
-                parsedState.headingDegrees =
-                    ParseFloat(value, parsedState.headingDegrees);
+                currentBlockHasValues = true;
+            }
+            else
+            {
+                // Backward-compatible single-aircraft feed.
+                ApplyStateValue(
+                    legacyState,
+                    key,
+                    value);
 
-            else if (key == "pitch")
-                parsedState.pitchDegrees =
-                    ParseFloat(value, parsedState.pitchDegrees);
-
-            else if (key == "roll")
-                parsedState.rollDegrees =
-                    ParseFloat(value, parsedState.rollDegrees);
-
-            else if (key == "gear")
-                parsedState.gearRatio =
-                    ParseFloat(value, parsedState.gearRatio);
-
-            else if (key == "flaps")
-                parsedState.flapRatio =
-                    ParseFloat(value, parsedState.flapRatio);
-
-            else if (key == "thrust")
-                parsedState.thrustRatio =
-                    ParseFloat(value, parsedState.thrustRatio);
-
-            else if (key == "taxi_light")
-                parsedState.taxiLight =
-                    ParseBool(value, parsedState.taxiLight);
-
-            else if (key == "landing_light")
-                parsedState.landingLight =
-                    ParseBool(value, parsedState.landingLight);
-
-            else if (key == "beacon_light")
-                parsedState.beaconLight =
-                    ParseBool(value, parsedState.beaconLight);
-
-            else if (key == "strobe_light")
-                parsedState.strobeLight =
-                    ParseBool(value, parsedState.strobeLight);
-
-            else if (key == "nav_light")
-                parsedState.navLight =
-                    ParseBool(value, parsedState.navLight);
+                legacyStateHasValues = true;
+            }
         }
 
-        if (parsedState.icaoType.empty())
-            parsedState.icaoType = "A319";
+        if (insideAircraftBlock &&
+            currentBlockHasValues &&
+            parsedFeed.aircraft.size() < MAX_REMOTE_AIRCRAFT)
+        {
+            AddParsedAircraft(
+                parsedFeed,
+                currentBlockState,
+                parsedIndex++);
+        }
 
-        if (parsedState.callsign.empty())
-            parsedState.callsign = "AEROPATH";
+        if (legacyStateHasValues &&
+            parsedFeed.aircraft.empty())
+        {
+            AddParsedAircraft(
+                parsedFeed,
+                legacyState,
+                parsedIndex);
+        }
 
         return true;
     }
 
-    void ReloadTrafficFeed()
+    void SynchroniseAircraft(
+        const ParsedTrafficFeed& parsedFeed)
     {
-        TrafficState parsedState;
+        gFeedEnabled = parsedFeed.enabled;
 
-        if (!ReadTrafficFile(parsedState))
+        if (!ShouldRenderTraffic())
         {
-            RemoveAircraft();
+            RemoveAllAircraft();
             return;
         }
 
-        const TrafficState previousState = gTrafficState;
-        gTrafficState = parsedState;
+        std::unordered_set<std::string> desiredKeys;
 
-        if (ShouldRenderTraffic())
+        for (const auto& entry : parsedFeed.aircraft)
         {
-            CreateAircraft();
-            ApplyAircraftIdentity(previousState, gTrafficState);
-
-            if (gRemoteAircraft)
-                gRemoteAircraft->SetVisible(gAircraftVisible);
+            desiredKeys.insert(entry.first);
         }
-        else
+
+        std::vector<std::string> keysToRemove;
+
+        for (const auto& entry : gRemoteAircraft)
         {
-            RemoveAircraft();
+            if (desiredKeys.find(entry.first) ==
+                desiredKeys.end())
+            {
+                keysToRemove.push_back(entry.first);
+            }
+        }
+
+        for (const std::string& key : keysToRemove)
+            RemoveAircraft(key);
+
+        for (const auto& entry : parsedFeed.aircraft)
+        {
+            const std::string& key = entry.first;
+            const TrafficState& state = entry.second;
+
+            const auto existing =
+                gRemoteAircraft.find(key);
+
+            if (existing == gRemoteAircraft.end())
+            {
+                CreateAircraft(key, state);
+                continue;
+            }
+
+            try
+            {
+                const TrafficState previousState =
+                    existing->second->State();
+
+                existing->second->ApplyState(state);
+                existing->second->SetVisible(gAircraftVisible);
+
+                const bool modelChanged =
+                    previousState.icaoType != state.icaoType ||
+                    previousState.airline != state.airline ||
+                    previousState.livery != state.livery;
+
+                if (modelChanged)
+                {
+                    LogMessage(
+                        "AeroPath Traffic: Model request for '%s' changed to %s/%s",
+                        state.callsign.c_str(),
+                        state.icaoType.c_str(),
+                        state.airline.c_str());
+                }
+            }
+            catch (const XPMP2::XPMP2Error& exception)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Could not update '%s': %s",
+                    state.callsign.c_str(),
+                    exception.what());
+            }
+            catch (const std::exception& exception)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Could not update '%s': %s",
+                    state.callsign.c_str(),
+                    exception.what());
+            }
+        }
+
+        if (gLastReportedTrafficCount !=
+            gRemoteAircraft.size())
+        {
+            gLastReportedTrafficCount =
+                gRemoteAircraft.size();
+
+            LogMessage(
+                "AeroPath Traffic: %zu remote aircraft active",
+                gLastReportedTrafficCount);
         }
 
         UpdateMenuCheckmarks();
+    }
+
+    void ReloadTrafficFeed()
+    {
+        ParsedTrafficFeed parsedFeed;
+
+        if (!ReadTrafficFile(parsedFeed))
+        {
+            gFeedEnabled = false;
+            RemoveAllAircraft();
+            return;
+        }
+
+        SynchroniseAircraft(parsedFeed);
     }
 
     float TrafficFileLoop(
@@ -810,8 +1182,11 @@ namespace
     {
         gAircraftVisible = !gAircraftVisible;
 
-        if (gRemoteAircraft)
-            gRemoteAircraft->SetVisible(gAircraftVisible);
+        for (auto& entry : gRemoteAircraft)
+        {
+            if (entry.second)
+                entry.second->SetVisible(gAircraftVisible);
+        }
 
         UpdateMenuCheckmarks();
     }
@@ -834,10 +1209,10 @@ namespace
             case MENU_TRAFFIC_ENABLED:
                 gMasterEnabled = !gMasterEnabled;
 
-                if (ShouldRenderTraffic())
-                    CreateAircraft();
+                if (gMasterEnabled)
+                    ReloadTrafficFeed();
                 else
-                    RemoveAircraft();
+                    RemoveAllAircraft();
 
                 break;
 
@@ -987,6 +1362,8 @@ PLUGIN_API int XPluginStart(
 
 PLUGIN_API void XPluginStop()
 {
+    RemoveAllAircraft();
+
     if (gMenu)
     {
         XPLMDestroyMenu(gMenu);
@@ -1052,7 +1429,7 @@ PLUGIN_API int XPluginEnable()
             "AeroPath Traffic",
             resourcePath.c_str(),
             PreferencesCallback,
-            "A319");
+            "C172");
 
     if (result[0])
     {
@@ -1089,6 +1466,9 @@ PLUGIN_API int XPluginEnable()
         PlaneNotifier,
         nullptr);
 
+    gFeedEnabled = true;
+    gLastReportedTrafficCount = static_cast<std::size_t>(-1);
+
     ReloadTrafficFeed();
 
     XPLMRegisterFlightLoopCallback(
@@ -1099,7 +1479,7 @@ PLUGIN_API int XPluginEnable()
     UpdateMenuCheckmarks();
 
     LogMessage(
-        "AeroPath Traffic: Enabled; reading feed '%s'",
+        "AeroPath Traffic: Enabled; reading multi-aircraft feed '%s'",
         gTrafficFilePath.c_str());
 
     return 1;
@@ -1111,7 +1491,7 @@ PLUGIN_API void XPluginDisable()
         TrafficFileLoop,
         nullptr);
 
-    RemoveAircraft();
+    RemoveAllAircraft();
 
     XPMPMultiplayerDisable();
 
