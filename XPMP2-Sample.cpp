@@ -51,6 +51,9 @@ namespace
     constexpr double PI = 3.141592653589793238462643383279502884;
     constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.25f;
     constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
+    constexpr double MIN_INTERPOLATION_SECONDS = 0.20;
+    constexpr double DEFAULT_INTERPOLATION_SECONDS = 1.00;
+    constexpr double MAX_INTERPOLATION_SECONDS = 5.00;
     constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
 
     XPLMMenuID gMenu = nullptr;
@@ -438,6 +441,14 @@ public:
           state_(initialState)
     {
         bClampToGround = true;
+
+        interpolationFrom_ = initialState;
+        interpolationTo_ = initialState;
+
+        const double nowSeconds = XPLMGetElapsedTime();
+        interpolationStartSeconds_ = nowSeconds;
+        lastSnapshotSeconds_ = nowSeconds;
+
         EnforceDeterministicModelPolicy();
         ApplyIdentity(state_);
     }
@@ -461,6 +472,41 @@ public:
             state_.flightNumber != nextState.flightNumber ||
             state_.callsign != nextState.callsign ||
             state_.uniqueId != nextState.uniqueId;
+
+        const double nowSeconds = XPLMGetElapsedTime();
+        const bool motionChanged =
+            HasMotionChanged(interpolationTo_, nextState);
+
+        if (motionChanged)
+        {
+            const TrafficState currentRenderedState =
+                BuildInterpolatedState(nowSeconds);
+
+            double observedIntervalSeconds =
+                nowSeconds - lastSnapshotSeconds_;
+
+            if (!std::isfinite(observedIntervalSeconds) ||
+                observedIntervalSeconds < MIN_INTERPOLATION_SECONDS)
+            {
+                observedIntervalSeconds =
+                    DEFAULT_INTERPOLATION_SECONDS;
+            }
+
+            interpolationFrom_ = currentRenderedState;
+            interpolationTo_ = nextState;
+            interpolationStartSeconds_ = nowSeconds;
+            interpolationDurationSeconds_ = std::clamp(
+                observedIntervalSeconds,
+                MIN_INTERPOLATION_SECONDS,
+                MAX_INTERPOLATION_SECONDS);
+
+            lastSnapshotSeconds_ = nowSeconds;
+        }
+        else
+        {
+            // Keep non-positional state, such as lights, current immediately.
+            interpolationTo_ = nextState;
+        }
 
         state_ = nextState;
 
@@ -544,7 +590,7 @@ public:
             const std::string& requestedAirline)
         {
             if (Trim(requestedAirline).empty())
-                return true;
+                return false;
 
             for (const CSLModelInfo_t::MatchCrit_t& criterion :
                  modelInfo.vecMatchCrit)
@@ -555,6 +601,19 @@ public:
                 {
                     return true;
                 }
+            }
+
+            return false;
+        };
+
+        const auto modelHasAnyAirline = [](
+            const CSLModelInfo_t& modelInfo)
+        {
+            for (const CSLModelInfo_t::MatchCrit_t& criterion :
+                 modelInfo.vecMatchCrit)
+            {
+                if (!Trim(criterion.icaoAirline).empty())
+                    return true;
             }
 
             return false;
@@ -590,31 +649,70 @@ public:
             return std::string{};
         };
 
+        const bool airlineRequested =
+            !Trim(state_.airline).empty();
+
         CSLModelInfo_t modelInfo = GetModelInfo();
         int selectedMatchQuality = GetMatchQuality();
 
-        const bool exactAircraft =
-            sameCode(modelInfo.icaoType, state_.icaoType);
+        const auto acceptCurrentModel =
+            [&sameCode,
+             &modelSupportsAirline,
+             &modelHasAnyAirline,
+             &airlineRequested,
+             MAXIMUM_RELATED_FAMILY_QUALITY,
+             this](
+                const CSLModelInfo_t& candidate,
+                const int quality)
+        {
+            const bool exactAircraft =
+                sameCode(
+                    candidate.icaoType,
+                    state_.icaoType);
 
-        const bool matchingAirline =
-            modelSupportsAirline(
-                modelInfo,
-                state_.airline);
+            const bool acceptableShape =
+                exactAircraft ||
+                (quality >= 0 &&
+                 quality <= MAXIMUM_RELATED_FAMILY_QUALITY);
+
+            if (!acceptableShape)
+                return false;
+
+            if (airlineRequested)
+            {
+                /*
+                 * With an airline requested, only accept that airline or a
+                 * genuinely generic model. Never accept another operator just
+                 * because the aircraft type happens to be exact.
+                 */
+                return
+                    modelSupportsAirline(
+                        candidate,
+                        state_.airline) ||
+                    !modelHasAnyAirline(candidate);
+            }
+
+            /*
+             * Without an airline identity, a generic CSL model is safer than a
+             * random airline paint. Suppress operator-specific models until
+             * AeroPath can resolve the operator.
+             */
+            return !modelHasAnyAirline(candidate);
+        };
 
         std::string selectedModelAirline =
             modelAirlineForLog(
                 modelInfo,
                 state_.airline);
 
-        if (exactAircraft ||
-            (matchingAirline &&
-             selectedMatchQuality >= 0 &&
-             selectedMatchQuality <= MAXIMUM_RELATED_FAMILY_QUALITY))
+        if (acceptCurrentModel(
+                modelInfo,
+                selectedMatchQuality))
         {
             SetRender(true);
 
             LogMessage(
-                "AeroPath Traffic: Deterministic match accepted for '%s': requested %s/%s/%s -> %s/%s using '%s' (quality %d)",
+                "AeroPath Traffic: Strict match accepted for '%s': requested %s/%s/%s -> %s/%s using '%s' (quality %d)",
                 state_.callsign.c_str(),
                 state_.icaoType.c_str(),
                 state_.airline.c_str(),
@@ -628,12 +726,47 @@ public:
         }
 
         /*
-         * XPMP2 normally prefers a related aircraft carrying the requested
-         * airline livery over an exact aircraft type with the wrong livery.
-         * AeroPath intentionally reverses that trade-off: aircraft shape and
-         * family come first, then airline/livery. Re-run matching without the
-         * operator inputs so an installed exact type cannot be displaced by an
-         * unrelated aircraft merely because it has the requested paint.
+         * Remove any descriptive livery text and retry the exact airline. CSL
+         * packages primarily identify operators using the three-letter ICAO
+         * airline code.
+         */
+        if (airlineRequested)
+        {
+            selectedMatchQuality = ChangeModel(
+                state_.icaoType,
+                state_.airline,
+                "");
+
+            modelInfo = GetModelInfo();
+            selectedModelAirline =
+                modelAirlineForLog(
+                    modelInfo,
+                    state_.airline);
+
+            if (acceptCurrentModel(
+                    modelInfo,
+                    selectedMatchQuality))
+            {
+                SetRender(true);
+
+                LogMessage(
+                    "AeroPath Traffic: Airline retry accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)",
+                    state_.callsign.c_str(),
+                    state_.icaoType.c_str(),
+                    state_.airline.c_str(),
+                    modelInfo.icaoType.c_str(),
+                    selectedModelAirline.c_str(),
+                    modelInfo.modelName.c_str(),
+                    selectedMatchQuality);
+
+                return;
+            }
+        }
+
+        /*
+         * Final fallback is type/family without an operator criterion, but only
+         * a generic model may be rendered. This prevents Wave Air, Pacific Air
+         * or any other unrelated airline paint from being selected.
          */
         selectedMatchQuality = ChangeModel(
             state_.icaoType,
@@ -647,48 +780,54 @@ public:
                 state_.airline);
 
         const bool fallbackExactAircraft =
-            sameCode(modelInfo.icaoType, state_.icaoType);
+            sameCode(
+                modelInfo.icaoType,
+                state_.icaoType);
 
-        const bool acceptableRelatedFamily =
-            selectedMatchQuality >= 0 &&
-            selectedMatchQuality <= MAXIMUM_RELATED_FAMILY_QUALITY;
+        const bool fallbackAcceptableShape =
+            fallbackExactAircraft ||
+            (selectedMatchQuality >= 0 &&
+             selectedMatchQuality <=
+                 MAXIMUM_RELATED_FAMILY_QUALITY);
 
-        if (fallbackExactAircraft || acceptableRelatedFamily)
+        const bool fallbackGeneric =
+            !modelHasAnyAirline(modelInfo);
+
+        if (fallbackAcceptableShape &&
+            fallbackGeneric)
         {
             SetRender(true);
 
             LogMessage(
-                "AeroPath Traffic: Type-first fallback accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)",
+                "AeroPath Traffic: Generic type fallback accepted for '%s': requested %s/%s -> %s using '%s' (quality %d)",
                 state_.callsign.c_str(),
                 state_.icaoType.c_str(),
                 state_.airline.c_str(),
                 modelInfo.icaoType.c_str(),
-                selectedModelAirline.c_str(),
                 modelInfo.modelName.c_str(),
                 selectedMatchQuality);
 
             return;
         }
 
-        /*
-         * A badly unrelated model is worse than no 3D model. Keep the target
-         * available to TCAS/interfaces but suppress the random visual model.
-         */
         SetRender(false);
 
         LogMessage(
-            "AeroPath Traffic: No acceptable model for '%s' (%s/%s). Rejected '%s' type %s quality %d; 3D rendering suppressed",
+            "AeroPath Traffic: No safe model for '%s' (%s/%s). Rejected '%s' type %s airline %s quality %d; 3D rendering suppressed",
             state_.callsign.c_str(),
             state_.icaoType.c_str(),
             state_.airline.c_str(),
             modelInfo.modelName.c_str(),
             modelInfo.icaoType.c_str(),
+            selectedModelAirline.c_str(),
             selectedMatchQuality);
     }
 
     void UpdatePosition(float, int) override
     {
-        const TrafficState state = state_;
+        const TrafficState state =
+            BuildInterpolatedState(
+                XPLMGetElapsedTime());
 
         if (state.worldMode)
         {
@@ -765,7 +904,157 @@ public:
     }
 
 private:
+    static bool HasMotionChanged(
+        const TrafficState& previousState,
+        const TrafficState& nextState)
+    {
+        constexpr double POSITION_EPSILON = 0.0000001;
+        constexpr double ALTITUDE_EPSILON_FEET = 0.05;
+        constexpr float ANGLE_EPSILON_DEGREES = 0.05f;
+        constexpr float RATIO_EPSILON = 0.001f;
+
+        return
+            previousState.worldMode != nextState.worldMode ||
+            std::abs(previousState.latitude - nextState.latitude) >
+                POSITION_EPSILON ||
+            std::abs(previousState.longitude - nextState.longitude) >
+                POSITION_EPSILON ||
+            std::abs(previousState.altitudeFeet - nextState.altitudeFeet) >
+                ALTITUDE_EPSILON_FEET ||
+            std::abs(previousState.headingDegrees - nextState.headingDegrees) >
+                ANGLE_EPSILON_DEGREES ||
+            std::abs(previousState.pitchDegrees - nextState.pitchDegrees) >
+                ANGLE_EPSILON_DEGREES ||
+            std::abs(previousState.rollDegrees - nextState.rollDegrees) >
+                ANGLE_EPSILON_DEGREES ||
+            std::abs(previousState.gearRatio - nextState.gearRatio) >
+                RATIO_EPSILON ||
+            std::abs(previousState.flapRatio - nextState.flapRatio) >
+                RATIO_EPSILON ||
+            std::abs(previousState.thrustRatio - nextState.thrustRatio) >
+                RATIO_EPSILON;
+    }
+
+    static double InterpolateDouble(
+        const double fromValue,
+        const double toValue,
+        const double progress)
+    {
+        return fromValue +
+            (toValue - fromValue) * progress;
+    }
+
+    static float InterpolateFloat(
+        const float fromValue,
+        const float toValue,
+        const double progress)
+    {
+        return static_cast<float>(
+            fromValue +
+            (toValue - fromValue) * progress);
+    }
+
+    static float InterpolateHeading(
+        const float fromHeading,
+        const float toHeading,
+        const double progress)
+    {
+        float difference =
+            NormaliseHeading(toHeading) -
+            NormaliseHeading(fromHeading);
+
+        if (difference > 180.0f)
+            difference -= 360.0f;
+        else if (difference < -180.0f)
+            difference += 360.0f;
+
+        return NormaliseHeading(
+            fromHeading +
+            static_cast<float>(difference * progress));
+    }
+
+    TrafficState BuildInterpolatedState(
+        const double nowSeconds) const
+    {
+        TrafficState renderedState = state_;
+
+        if (interpolationDurationSeconds_ <= 0.0 ||
+            interpolationFrom_.worldMode != interpolationTo_.worldMode)
+        {
+            renderedState.latitude = interpolationTo_.latitude;
+            renderedState.longitude = interpolationTo_.longitude;
+            renderedState.altitudeFeet = interpolationTo_.altitudeFeet;
+            renderedState.headingDegrees =
+                interpolationTo_.headingDegrees;
+            renderedState.pitchDegrees = interpolationTo_.pitchDegrees;
+            renderedState.rollDegrees = interpolationTo_.rollDegrees;
+            renderedState.gearRatio = interpolationTo_.gearRatio;
+            renderedState.flapRatio = interpolationTo_.flapRatio;
+            renderedState.thrustRatio = interpolationTo_.thrustRatio;
+            return renderedState;
+        }
+
+        const double progress = std::clamp(
+            (nowSeconds - interpolationStartSeconds_) /
+                interpolationDurationSeconds_,
+            0.0,
+            1.0);
+
+        renderedState.latitude = InterpolateDouble(
+            interpolationFrom_.latitude,
+            interpolationTo_.latitude,
+            progress);
+
+        renderedState.longitude = InterpolateDouble(
+            interpolationFrom_.longitude,
+            interpolationTo_.longitude,
+            progress);
+
+        renderedState.altitudeFeet = InterpolateDouble(
+            interpolationFrom_.altitudeFeet,
+            interpolationTo_.altitudeFeet,
+            progress);
+
+        renderedState.headingDegrees = InterpolateHeading(
+            interpolationFrom_.headingDegrees,
+            interpolationTo_.headingDegrees,
+            progress);
+
+        renderedState.pitchDegrees = InterpolateFloat(
+            interpolationFrom_.pitchDegrees,
+            interpolationTo_.pitchDegrees,
+            progress);
+
+        renderedState.rollDegrees = InterpolateFloat(
+            interpolationFrom_.rollDegrees,
+            interpolationTo_.rollDegrees,
+            progress);
+
+        renderedState.gearRatio = InterpolateFloat(
+            interpolationFrom_.gearRatio,
+            interpolationTo_.gearRatio,
+            progress);
+
+        renderedState.flapRatio = InterpolateFloat(
+            interpolationFrom_.flapRatio,
+            interpolationTo_.flapRatio,
+            progress);
+
+        renderedState.thrustRatio = InterpolateFloat(
+            interpolationFrom_.thrustRatio,
+            interpolationTo_.thrustRatio,
+            progress);
+
+        return renderedState;
+    }
+
     TrafficState state_;
+    TrafficState interpolationFrom_;
+    TrafficState interpolationTo_;
+
+    double interpolationStartSeconds_ = 0.0;
+    double interpolationDurationSeconds_ = 0.0;
+    double lastSnapshotSeconds_ = 0.0;
 };
 
 namespace
