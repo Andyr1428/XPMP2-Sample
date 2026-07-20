@@ -1,4 +1,4 @@
-# XPMP2-Sample
+# AeroPath Traffic
 # - Set up to be used in the provided docker environment to build lin and mac
 # - Set up to be used in a Visual Studio environment to build win (File > Open > Folder, then VS recognized the CMAKE configuration)
 #
@@ -28,9 +28,9 @@ else()
     set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "Archs to build")
 endif()
 
-project(XPMP2-Sample
-        VERSION 3.3.0
-        DESCRIPTION "XPMP2-Sample X-Plane plugin")
+project(AeroPathTraffic
+        VERSION 3.1.0
+        DESCRIPTION "AeroPath multiplayer traffic plugin for X-Plane 12")
 
 message ("== Building: ${PROJECT_NAME} ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH} ==")
 message ("Compiler Info:")
@@ -125,12 +125,12 @@ endif()
 ################################################################################
 # Source Files
 ################################################################################
-add_library(XPMP2-Sample MODULE
+add_library(AeroPathTraffic MODULE
     XPMP2-Sample.cpp
 )
 
 # Header include directories
-target_include_directories(XPMP2-Sample PRIVATE
+target_include_directories(AeroPathTraffic PRIVATE
     ${ADDITIONAL_INCLUDES}
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/XPMP2/lib/SDK/CHeaders/XPLM
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/XPMP2/inc
@@ -172,21 +172,21 @@ endif ()
 
 # Incude building/linking XPMP2
 add_subdirectory(lib/XPMP2)
-add_dependencies(XPMP2-Sample XPMP2)
-target_link_libraries(XPMP2-Sample XPMP2)
+add_dependencies(AeroPathTraffic XPMP2)
+target_link_libraries(AeroPathTraffic XPMP2)
 
 if (WIN32)
     # Link with winsock for network and iphlpapi for GetAdaptersAddresses
-    target_link_libraries(XPMP2-Sample ${XPLM_LIBRARY} ${FMOD_LIBRARY} wsock32 ws2_32 iphlpapi)
+    target_link_libraries(AeroPathTraffic ${XPLM_LIBRARY} ${FMOD_LIBRARY} wsock32 ws2_32 iphlpapi)
     if (MINGW)
         # When cross-compiling we link the standard libraries statically
-        target_link_options(XPMP2-Sample PRIVATE -static-libgcc -static-libstdc++)
+        target_link_options(AeroPathTraffic PRIVATE -static-libgcc -static-libstdc++)
     endif()
 elseif (APPLE)
     # Link OS X core system libraries.
     find_library(IOKIT_LIBRARY IOKit REQUIRED)
     find_library(CORE_FOUNDATION_LIBRARY CoreFoundation REQUIRED)
-    target_link_libraries(XPMP2-Sample
+    target_link_libraries(AeroPathTraffic
         ${XPLM_LIBRARY}
         ${FMOD_LIBRARY}
         ${IOKIT_LIBRARY}
@@ -200,24 +200,24 @@ elseif (UNIX)
     set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
     set(THREADS_PREFER_PTHREAD_FLAG TRUE)
     find_package(Threads REQUIRED)
-    target_link_libraries(XPMP2-Sample ${DL_LIBRARY} Threads::Threads)
+    target_link_libraries(AeroPathTraffic ${DL_LIBRARY} Threads::Threads)
     # Restrict set of symbols exported from the plugin to the ones required by XPLM:
-    target_link_options(XPMP2-Sample PRIVATE -Wl,--version-script -Wl,${CMAKE_CURRENT_SOURCE_DIR}/XPMP2-Sample.sym)
+    target_link_options(AeroPathTraffic PRIVATE -Wl,--version-script -Wl,${CMAKE_CURRENT_SOURCE_DIR}/XPMP2-Sample.sym)
 endif ()
 
 
 # Target directory and file name
 if (WIN32)
-   set_target_properties(XPMP2-Sample PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/win_x64")
+   set_target_properties(AeroPathTraffic PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/win_x64")
 elseif (APPLE)
-   set_target_properties(XPMP2-Sample PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mac_x64")
+   set_target_properties(AeroPathTraffic PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mac_x64")
 elseif (UNIX)
-   set_target_properties(XPMP2-Sample PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lin_x64")
+   set_target_properties(AeroPathTraffic PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lin_x64")
 endif ()
 
-set_target_properties(XPMP2-Sample
+set_target_properties(AeroPathTraffic
     PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "XPMP2-Sample"
+    OUTPUT_NAME "AeroPathTraffic"
     SUFFIX ".xpl"
 )
