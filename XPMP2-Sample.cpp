@@ -3,7 +3,7 @@
 /// @details    Renders multiple AeroPath-controlled aircraft through XPMP2 and
 ///             reads their states from Resources/AeroPathTraffic.txt.
 ///
-///             Feed version 3 uses repeated [aircraft] blocks and explicit aircraft/operator/livery identity. The original
+///             Feed version 4 uses repeated [aircraft] blocks and explicit aircraft/operator/livery identity. The original
 ///             single-aircraft key/value feed remains supported so existing
 ///             development installations continue to work while the AeroPath
 ///             desktop writer is upgraded.
@@ -93,6 +93,12 @@ namespace
         std::string registration;
         std::string flightNumber;
         std::string callsign = "AEROPATH";
+
+        bool labelConfigured = false;
+        std::string labelText;
+        float labelRed = 1.0f;
+        float labelGreen = 1.0f;
+        float labelBlue = 1.0f;
 
         // Relative mode remains available for local development.
         float forwardMetres = 300.0f;
@@ -471,7 +477,12 @@ public:
             state_.registration != nextState.registration ||
             state_.flightNumber != nextState.flightNumber ||
             state_.callsign != nextState.callsign ||
-            state_.uniqueId != nextState.uniqueId;
+            state_.uniqueId != nextState.uniqueId ||
+            state_.labelConfigured != nextState.labelConfigured ||
+            state_.labelText != nextState.labelText ||
+            state_.labelRed != nextState.labelRed ||
+            state_.labelGreen != nextState.labelGreen ||
+            state_.labelBlue != nextState.labelBlue;
 
         const double nowSeconds = XPLMGetElapsedTime();
         const bool motionChanged =
@@ -526,11 +537,26 @@ public:
 
     void ApplyIdentity(const TrafficState& state)
     {
-        label = state.callsign;
+        label =
+            state.labelConfigured
+                ? state.labelText
+                : state.callsign;
 
-        colLabel[0] = 0.0f;
-        colLabel[1] = 1.0f;
-        colLabel[2] = 0.0f;
+        colLabel[0] =
+            std::clamp(
+                state.labelRed,
+                0.0f,
+                1.0f);
+        colLabel[1] =
+            std::clamp(
+                state.labelGreen,
+                0.0f,
+                1.0f);
+        colLabel[2] =
+            std::clamp(
+                state.labelBlue,
+                0.0f,
+                1.0f);
 
         acRadar.code = 1200;
         acRadar.mode = xpmpTransponderMode_ModeC;
@@ -1227,6 +1253,34 @@ namespace
         else if (key == "callsign")
             state.callsign = ToUpper(value);
 
+        else if (key == "label" ||
+                 key == "label_text")
+        {
+            state.labelConfigured = true;
+            state.labelText = value;
+        }
+
+        else if (key == "label_red")
+            state.labelRed =
+                std::clamp(
+                    ParseFloat(value, state.labelRed),
+                    0.0f,
+                    1.0f);
+
+        else if (key == "label_green")
+            state.labelGreen =
+                std::clamp(
+                    ParseFloat(value, state.labelGreen),
+                    0.0f,
+                    1.0f);
+
+        else if (key == "label_blue")
+            state.labelBlue =
+                std::clamp(
+                    ParseFloat(value, state.labelBlue),
+                    0.0f,
+                    1.0f);
+
         else if (key == "forward_m")
             state.forwardMetres =
                 ParseFloat(value, state.forwardMetres);
@@ -1318,6 +1372,13 @@ namespace
         state.livery = ToUpper(Trim(state.livery));
         state.registration = ToUpper(Trim(state.registration));
         state.flightNumber = ToUpper(Trim(state.flightNumber));
+        state.labelText = Trim(state.labelText);
+        state.labelRed =
+            std::clamp(state.labelRed, 0.0f, 1.0f);
+        state.labelGreen =
+            std::clamp(state.labelGreen, 0.0f, 1.0f);
+        state.labelBlue =
+            std::clamp(state.labelBlue, 0.0f, 1.0f);
 
         if (state.icaoType.empty())
             state.icaoType = "C172";
