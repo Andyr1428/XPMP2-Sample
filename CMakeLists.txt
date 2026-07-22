@@ -221,3 +221,25 @@ set_target_properties(AeroPathTraffic
     OUTPUT_NAME "AeroPathTraffic"
     SUFFIX ".xpl"
 )
+
+
+################################################################################
+# AeroPath Taxi Guidance Resources
+################################################################################
+
+set(AEROPATH_TAXI_GUIDANCE_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/TaxiGuidance")
+
+add_custom_command(
+    TARGET AeroPathTraffic
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/TaxiGuidance"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${AEROPATH_TAXI_GUIDANCE_SOURCE_DIR}/AeroPathTaxiLight.obj"
+        "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/TaxiGuidance/AeroPathTaxiLight.obj"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${AEROPATH_TAXI_GUIDANCE_SOURCE_DIR}/AeroPathTaxiLight.png"
+        "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/TaxiGuidance/AeroPathTaxiLight.png"
+    COMMENT "Copying AeroPath taxi-guidance resources"
+)
