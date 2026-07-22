@@ -9,6 +9,8 @@ namespace AeroPathTaxiGuidance
 
     void SetVisible(bool visible);
     bool IsVisible();
+    bool IsManualVisible();
+    bool IsAutomaticVisible();
     void ToggleVisible();
 
     void RebuildRoute();

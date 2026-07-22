@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -50,6 +51,8 @@ namespace
     constexpr double ROUTE_RETRY_INTERVAL_SECONDS = 5.0;
     constexpr double MAX_START_NODE_DISTANCE_METRES = 1500.0;
     constexpr double OFF_ROUTE_REBUILD_DISTANCE_METRES = 90.0;
+    constexpr double ROUTE_COMPLETION_DISTANCE_METRES = 28.0;
+    constexpr long long CONFIG_STALE_AFTER_SECONDS = 35;
 
     struct GeoPoint
     {
@@ -71,6 +74,8 @@ namespace
         std::string airport;
         std::string runway;
         std::string phase;
+        long long generatedUnix = 0;
+        std::string contextKey;
         std::string rawContent;
     };
 
@@ -115,7 +120,9 @@ namespace
     };
 
     bool gInitialised = false;
-    bool gVisible = false;
+    bool gManualVisible = false;
+    bool gAutomaticVisible = false;
+    bool gRouteCompleted = false;
     bool gRouteValid = false;
     bool gUsingStraightFallback = false;
 
@@ -140,6 +147,26 @@ namespace
     XPLMDataRef gHeading = nullptr;
 
     std::vector<GeoPoint> gRoutePoints;
+
+    bool ShouldRenderGuidance()
+    {
+        return gManualVisible || gAutomaticVisible;
+    }
+
+    bool IsConfigFresh(const TaxiConfig& config)
+    {
+        // Automatic mode requires the Stage 3 desktop heartbeat. A Stage 2
+        // file can still be used through the manual menu option.
+        if (config.generatedUnix <= 0)
+            return false;
+
+        const long long now = static_cast<long long>(std::time(nullptr));
+        if (now <= 0)
+            return true;
+
+        const long long age = now - config.generatedUnix;
+        return age >= -5 && age <= CONFIG_STALE_AFTER_SECONDS;
+    }
 
     void LogMessage(const char* format, ...)
     {
@@ -483,7 +510,24 @@ namespace
                 config.runway = NormaliseRunway(value);
             else if (key == "phase")
                 config.phase = value;
+            else if (key == "generated_unix")
+            {
+                try
+                {
+                    config.generatedUnix = std::stoll(value);
+                }
+                catch (...)
+                {
+                    config.generatedUnix = 0;
+                }
+            }
         }
+
+        config.contextKey =
+            std::string(config.enabled ? "1" : "0") + "|" +
+            ToUpper(config.airport) + "|" +
+            NormaliseRunway(config.runway) + "|" +
+            ToLower(config.phase);
 
         return config;
     }
@@ -1283,6 +1327,18 @@ namespace
         return false;
     }
 
+    double LocalRouteLength(const std::vector<LocalPoint>& route)
+    {
+        double length = 0.0;
+        for (std::size_t index = 1; index < route.size(); ++index)
+        {
+            const double dx = route[index].x - route[index - 1].x;
+            const double dz = route[index].z - route[index - 1].z;
+            length += std::sqrt(dx * dx + dz * dz);
+        }
+        return length;
+    }
+
     void UpdateStraightFallback()
     {
         const double localX = XPLMGetDatad(gLocalX);
@@ -1345,6 +1401,21 @@ namespace
         aircraft.z = XPLMGetDatad(gLocalZ);
 
         const RouteProjection projection = ProjectOntoRoute(route, aircraft);
+        const double remainingDistance =
+            std::max(0.0, LocalRouteLength(route) - projection.alongDistance);
+
+        if (gAutomaticVisible && !gManualVisible &&
+            remainingDistance <= ROUTE_COMPLETION_DISTANCE_METRES &&
+            projection.distanceFromRoute <= 45.0)
+        {
+            gRouteCompleted = true;
+            HideAllLights();
+            LogMessage(
+                "AeroPath Traffic: Taxi route complete at runway %s; automatic lights hidden",
+                gActiveRunway.empty() ? "entry" : gActiveRunway.c_str());
+            return;
+        }
+
         if (projection.distanceFromRoute > OFF_ROUTE_REBUILD_DISTANCE_METRES &&
             XPLMGetElapsedTime() - gLastRouteAttemptSeconds > ROUTE_RETRY_INTERVAL_SECONDS)
         {
@@ -1434,7 +1505,9 @@ namespace AeroPathTaxiGuidance
 
     void Shutdown()
     {
-        gVisible = false;
+        gManualVisible = false;
+        gAutomaticVisible = false;
+        gRouteCompleted = false;
         gInitialised = false;
         gRouteValid = false;
         gUsingStraightFallback = false;
@@ -1448,34 +1521,49 @@ namespace AeroPathTaxiGuidance
 
     void SetVisible(bool visible)
     {
-        if (!visible)
+        gManualVisible = visible;
+
+        if (!ShouldRenderGuidance())
         {
-            gVisible = false;
             HideAllLights();
-            LogMessage("AeroPath Traffic: Taxi-route lights disabled");
+            LogMessage("AeroPath Traffic: Manual taxi-route lights disabled");
             return;
         }
 
         if (!gInitialised || !EnsureResourcesLoaded())
         {
-            gVisible = false;
+            gManualVisible = false;
             return;
         }
 
-        gVisible = true;
+        gRouteCompleted = false;
         RebuildRoute();
         Update();
-        LogMessage("AeroPath Traffic: Taxi-route lights enabled");
+
+        LogMessage(
+            visible
+                ? "AeroPath Traffic: Manual taxi-route lights enabled"
+                : "AeroPath Traffic: Manual taxi-route lights disabled; automatic guidance remains active");
     }
 
     bool IsVisible()
     {
-        return gVisible;
+        return ShouldRenderGuidance();
+    }
+
+    bool IsManualVisible()
+    {
+        return gManualVisible;
+    }
+
+    bool IsAutomaticVisible()
+    {
+        return gAutomaticVisible;
     }
 
     void ToggleVisible()
     {
-        SetVisible(!gVisible);
+        SetVisible(!gManualVisible);
     }
 
     void RebuildRoute()
@@ -1485,15 +1573,15 @@ namespace AeroPathTaxiGuidance
 
         gLastRouteAttemptSeconds = XPLMGetElapsedTime();
         const TaxiConfig config = ReadConfig();
-        gLastConfigContent = config.rawContent;
+        gLastConfigContent = config.contextKey;
+        gRouteCompleted = false;
 
-        if (config.filePresent && !config.enabled)
+        if (config.filePresent && !config.enabled && !gManualVisible)
         {
             gRouteValid = false;
             gUsingStraightFallback = false;
             gRoutePoints.clear();
             HideAllLights();
-            LogMessage("AeroPath Traffic: Taxi guidance is inactive in the AeroPath desktop feed");
             return;
         }
 
@@ -1502,31 +1590,58 @@ namespace AeroPathTaxiGuidance
 
     void Update()
     {
-        if (!gVisible || !gInitialised)
+        if (!gInitialised)
             return;
-
-        if (!EnsureResourcesLoaded())
-        {
-            gVisible = false;
-            return;
-        }
 
         const double now = XPLMGetElapsedTime();
         if (now - gLastConfigCheckSeconds >= CONFIG_CHECK_INTERVAL_SECONDS)
         {
             gLastConfigCheckSeconds = now;
             const TaxiConfig config = ReadConfig();
-            if (config.rawContent != gLastConfigContent)
+            const bool automaticRequested =
+                config.filePresent &&
+                config.enabled &&
+                IsConfigFresh(config);
+
+            if (automaticRequested != gAutomaticVisible)
             {
-                gLastConfigContent = config.rawContent;
-                RebuildRoute();
+                gAutomaticVisible = automaticRequested;
+                gRouteCompleted = false;
+
+                LogMessage(
+                    automaticRequested
+                        ? "AeroPath Traffic: Automatic taxi guidance activated by AeroPath"
+                        : "AeroPath Traffic: Automatic taxi guidance deactivated");
+
+                if (automaticRequested)
+                    RebuildRoute();
             }
 
-            if (config.filePresent && !config.enabled)
+            if (config.contextKey != gLastConfigContent)
+            {
+                gLastConfigContent = config.contextKey;
+                if (ShouldRenderGuidance())
+                    RebuildRoute();
+            }
+
+            if (!ShouldRenderGuidance())
             {
                 HideAllLights();
                 return;
             }
+        }
+
+        if (!ShouldRenderGuidance() || gRouteCompleted)
+        {
+            HideAllLights();
+            return;
+        }
+
+        if (!EnsureResourcesLoaded())
+        {
+            gManualVisible = false;
+            gAutomaticVisible = false;
+            return;
         }
 
         if (!gRouteValid && !gUsingStraightFallback &&
@@ -1537,4 +1652,5 @@ namespace AeroPathTaxiGuidance
 
         UpdateRouteLights();
     }
+
 }

@@ -1124,7 +1124,7 @@ namespace
         XPLMCheckMenuItem(
             gMenu,
             MENU_TAXI_ROUTE_LIGHTS,
-            AeroPathTaxiGuidance::IsVisible()
+            AeroPathTaxiGuidance::IsManualVisible()
                 ? xplm_Menu_Checked
                 : xplm_Menu_Unchecked);
 
@@ -1737,6 +1737,7 @@ namespace
     {
         ReloadTrafficFeed();
         AeroPathTaxiGuidance::Update();
+        UpdateMenuCheckmarks();
         return TRAFFIC_POLL_INTERVAL_SECONDS;
     }
 
@@ -1894,7 +1895,7 @@ PLUGIN_API int XPluginStart(
 
     XPLMAppendMenuItem(
         gMenu,
-        "Show Taxi Route Lights",
+        "Manual Taxi Route Lights",
         reinterpret_cast<void*>(MENU_TAXI_ROUTE_LIGHTS),
         0);
 
