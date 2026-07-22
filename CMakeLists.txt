@@ -50,7 +50,7 @@ endif()
 
 # Windows: Target Windows 7.0 and later
 if (WIN32)
-    add_compile_definitions(_WIN32_WINNT=0x0601)
+    add_compile_definitions(_WIN32_WINNT=0x0601 NOMINMAX)
     if (NOT DEFINED ENV{platform})
         set(ENV{platform} "win")
     endif()
@@ -127,6 +127,7 @@ endif()
 ################################################################################
 add_library(AeroPathTraffic MODULE
     XPMP2-Sample.cpp
+    AeroPathTaxiGuidance.cpp
 )
 
 # Header include directories

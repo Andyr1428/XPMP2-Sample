@@ -34,13 +34,12 @@
 #include "XPLMPlugin.h"
 #include "XPLMMenus.h"
 #include "XPLMGraphics.h"
-#include "XPLMInstance.h"
-#include "XPLMScenery.h"
 #include "XPLMProcessing.h"
 
 // XPMP2
 #include "XPMPAircraft.h"
 #include "XPMPMultiplayer.h"
+#include "AeroPathTaxiGuidance.h"
 
 #if !XPLM300
     #error This plugin requires X-Plane SDK 3.0 or newer
@@ -58,10 +57,6 @@ namespace
     constexpr double MAX_INTERPOLATION_SECONDS = 5.00;
     constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
 
-    constexpr std::size_t TAXI_TEST_LIGHT_COUNT = 20;
-    constexpr float TAXI_TEST_LIGHT_FIRST_OFFSET_METRES = 20.0f;
-    constexpr float TAXI_TEST_LIGHT_SPACING_METRES = 15.0f;
-    constexpr float TAXI_TEST_LIGHT_HEIGHT_OFFSET_METRES = 0.08f;
 
     XPLMMenuID gMenu = nullptr;
 
@@ -71,11 +66,6 @@ namespace
     bool gFeedFilePreviouslyMissing = false;
     bool gFeedFilePreviouslyStale = false;
 
-    bool gTaxiTestLightsVisible = false;
-    XPLMObjectRef gTaxiLightObject = nullptr;
-    XPLMProbeRef gTaxiTerrainProbe = nullptr;
-    std::vector<XPLMInstanceRef> gTaxiLightInstances;
-    std::string gTaxiLightObjectRelativePath;
 
     XPLMDataRef gLocalX = nullptr;
     XPLMDataRef gLocalY = nullptr;
@@ -150,7 +140,8 @@ namespace
         MENU_TRAFFIC_ENABLED = 0,
         MENU_AIRCRAFT_VISIBLE,
         MENU_RELOAD_FEED,
-        MENU_TAXI_TEST_LIGHTS,
+        MENU_TAXI_ROUTE_LIGHTS,
+        MENU_TAXI_REBUILD_ROUTE,
         MENU_AI_CONTROL,
 #ifdef DEBUG
         MENU_RELOAD_PLUGINS,
@@ -427,234 +418,6 @@ namespace
         return static_cast<XPMPPlaneID>(modeSId);
     }
 
-
-    std::string NormalisePathForComparison(std::string value)
-    {
-        std::replace(value.begin(), value.end(), '\\', '/');
-        return ToLower(value);
-    }
-
-    std::string MakePathRelativeToXPlaneRoot(
-        const std::string& absolutePath)
-    {
-        char systemPathBuffer[2048] = {};
-        XPLMGetSystemPath(systemPathBuffer);
-
-        const std::string systemPath = systemPathBuffer;
-        const std::string normalisedSystemPath =
-            NormalisePathForComparison(systemPath);
-        const std::string normalisedAbsolutePath =
-            NormalisePathForComparison(absolutePath);
-
-        if (!normalisedSystemPath.empty() &&
-            normalisedAbsolutePath.rfind(normalisedSystemPath, 0) == 0)
-        {
-            std::string relativePath =
-                absolutePath.substr(systemPath.size());
-
-            while (!relativePath.empty() &&
-                   (relativePath.front() == '\\' ||
-                    relativePath.front() == '/'))
-            {
-                relativePath.erase(relativePath.begin());
-            }
-
-            return relativePath;
-        }
-
-        return {};
-    }
-
-    void DestroyTaxiLightInstances()
-    {
-        for (XPLMInstanceRef instance : gTaxiLightInstances)
-        {
-            if (instance)
-                XPLMDestroyInstance(instance);
-        }
-
-        gTaxiLightInstances.clear();
-    }
-
-    void DestroyTaxiGuidanceResources()
-    {
-        DestroyTaxiLightInstances();
-
-        if (gTaxiLightObject)
-        {
-            XPLMUnloadObject(gTaxiLightObject);
-            gTaxiLightObject = nullptr;
-        }
-
-        if (gTaxiTerrainProbe)
-        {
-            XPLMDestroyProbe(gTaxiTerrainProbe);
-            gTaxiTerrainProbe = nullptr;
-        }
-    }
-
-    bool EnsureTaxiLightResourcesLoaded()
-    {
-        if (gTaxiLightObject &&
-            gTaxiTerrainProbe &&
-            gTaxiLightInstances.size() == TAXI_TEST_LIGHT_COUNT)
-        {
-            return true;
-        }
-
-        DestroyTaxiGuidanceResources();
-
-        if (gTaxiLightObjectRelativePath.empty())
-        {
-            LogMessage(
-                "AeroPath Traffic: Taxi-light object path is unavailable");
-            return false;
-        }
-
-        gTaxiLightObject =
-            XPLMLoadObject(gTaxiLightObjectRelativePath.c_str());
-
-        if (!gTaxiLightObject)
-        {
-            LogMessage(
-                "AeroPath Traffic: Could not load taxi-light object '%s'",
-                gTaxiLightObjectRelativePath.c_str());
-            return false;
-        }
-
-        gTaxiTerrainProbe = XPLMCreateProbe(xplm_ProbeY);
-
-        if (!gTaxiTerrainProbe)
-        {
-            LogMessage(
-                "AeroPath Traffic: Could not create taxi-light terrain probe");
-            DestroyTaxiGuidanceResources();
-            return false;
-        }
-
-        const char* instanceDataRefs[] = { nullptr };
-
-        for (std::size_t index = 0;
-             index < TAXI_TEST_LIGHT_COUNT;
-             ++index)
-        {
-            XPLMInstanceRef instance =
-                XPLMCreateInstance(gTaxiLightObject, instanceDataRefs);
-
-            if (!instance)
-            {
-                LogMessage(
-                    "AeroPath Traffic: Could not create taxi-light instance %zu",
-                    index + 1);
-                DestroyTaxiGuidanceResources();
-                return false;
-            }
-
-            gTaxiLightInstances.push_back(instance);
-        }
-
-        LogMessage(
-            "AeroPath Traffic: Loaded %zu test taxi-light instances",
-            gTaxiLightInstances.size());
-        return true;
-    }
-
-    void UpdateTaxiTestLights()
-    {
-        if (!gTaxiTestLightsVisible)
-            return;
-
-        if (!EnsureTaxiLightResourcesLoaded())
-        {
-            gTaxiTestLightsVisible = false;
-            return;
-        }
-
-        const float localX = static_cast<float>(XPLMGetDatad(gLocalX));
-        const float localY = static_cast<float>(XPLMGetDatad(gLocalY));
-        const float localZ = static_cast<float>(XPLMGetDatad(gLocalZ));
-        const float headingDegrees =
-            NormaliseHeading(XPLMGetDataf(gHeading));
-        const double headingRadians = DegreesToRadians(headingDegrees);
-
-        float unusedInstanceData = 0.0f;
-
-        for (std::size_t index = 0;
-             index < gTaxiLightInstances.size();
-             ++index)
-        {
-            const float forwardDistance =
-                TAXI_TEST_LIGHT_FIRST_OFFSET_METRES +
-                static_cast<float>(index) *
-                    TAXI_TEST_LIGHT_SPACING_METRES;
-
-            const float candidateX =
-                localX + static_cast<float>(
-                    std::sin(headingRadians) * forwardDistance);
-            const float candidateZ =
-                localZ - static_cast<float>(
-                    std::cos(headingRadians) * forwardDistance);
-
-            XPLMProbeInfo_t probeInfo = {};
-            probeInfo.structSize = sizeof(probeInfo);
-
-            const XPLMProbeResult probeResult =
-                XPLMProbeTerrainXYZ(
-                    gTaxiTerrainProbe,
-                    candidateX,
-                    localY,
-                    candidateZ,
-                    &probeInfo);
-
-            XPLMDrawInfo_t drawInfo = {};
-            drawInfo.structSize = sizeof(drawInfo);
-
-            if (probeResult == xplm_ProbeHitTerrain)
-            {
-                drawInfo.x = probeInfo.locationX;
-                drawInfo.y = probeInfo.locationY +
-                    TAXI_TEST_LIGHT_HEIGHT_OFFSET_METRES;
-                drawInfo.z = probeInfo.locationZ;
-            }
-            else
-            {
-                drawInfo.x = candidateX;
-                drawInfo.y = -100000.0f;
-                drawInfo.z = candidateZ;
-            }
-
-            drawInfo.pitch = 0.0f;
-            drawInfo.heading = headingDegrees;
-            drawInfo.roll = 0.0f;
-
-            XPLMInstanceSetPosition(
-                gTaxiLightInstances[index],
-                &drawInfo,
-                &unusedInstanceData);
-        }
-    }
-
-    void SetTaxiTestLightsVisible(const bool visible)
-    {
-        if (visible)
-        {
-            if (!EnsureTaxiLightResourcesLoaded())
-            {
-                gTaxiTestLightsVisible = false;
-                return;
-            }
-
-            gTaxiTestLightsVisible = true;
-            UpdateTaxiTestLights();
-            LogMessage("AeroPath Traffic: Test taxi lights enabled");
-        }
-        else
-        {
-            gTaxiTestLightsVisible = false;
-            DestroyTaxiLightInstances();
-            LogMessage("AeroPath Traffic: Test taxi lights disabled");
-        }
-    }
 
     int PreferencesCallback(
         const char*,
@@ -1360,8 +1123,8 @@ namespace
 
         XPLMCheckMenuItem(
             gMenu,
-            MENU_TAXI_TEST_LIGHTS,
-            gTaxiTestLightsVisible
+            MENU_TAXI_ROUTE_LIGHTS,
+            AeroPathTaxiGuidance::IsVisible()
                 ? xplm_Menu_Checked
                 : xplm_Menu_Unchecked);
 
@@ -1973,7 +1736,7 @@ namespace
         void*)
     {
         ReloadTrafficFeed();
-        UpdateTaxiTestLights();
+        AeroPathTaxiGuidance::Update();
         return TRAFFIC_POLL_INTERVAL_SECONDS;
     }
 
@@ -2023,8 +1786,12 @@ namespace
                 ReloadTrafficFeed();
                 break;
 
-            case MENU_TAXI_TEST_LIGHTS:
-                SetTaxiTestLightsVisible(!gTaxiTestLightsVisible);
+            case MENU_TAXI_ROUTE_LIGHTS:
+                AeroPathTaxiGuidance::ToggleVisible();
+                break;
+
+            case MENU_TAXI_REBUILD_ROUTE:
+                AeroPathTaxiGuidance::RebuildRoute();
                 break;
 
             case MENU_AI_CONTROL:
@@ -2127,8 +1894,14 @@ PLUGIN_API int XPluginStart(
 
     XPLMAppendMenuItem(
         gMenu,
-        "Show Test Taxi Lights",
-        reinterpret_cast<void*>(MENU_TAXI_TEST_LIGHTS),
+        "Show Taxi Route Lights",
+        reinterpret_cast<void*>(MENU_TAXI_ROUTE_LIGHTS),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Rebuild Taxi Route",
+        reinterpret_cast<void*>(MENU_TAXI_REBUILD_ROUTE),
         0);
 
     XPLMAppendMenuItem(
@@ -2171,8 +1944,7 @@ PLUGIN_API int XPluginStart(
 
 PLUGIN_API void XPluginStop()
 {
-    SetTaxiTestLightsVisible(false);
-    DestroyTaxiGuidanceResources();
+    AeroPathTaxiGuidance::Shutdown();
     RemoveAllAircraft();
 
     if (gMenu)
@@ -2235,27 +2007,7 @@ PLUGIN_API int XPluginEnable()
     gTrafficFilePath += pathSeparator;
     gTrafficFilePath += "AeroPathTraffic.txt";
 
-    std::string taxiLightAbsolutePath = resourcePath;
-    taxiLightAbsolutePath += pathSeparator;
-    taxiLightAbsolutePath += "TaxiGuidance";
-    taxiLightAbsolutePath += pathSeparator;
-    taxiLightAbsolutePath += "AeroPathTaxiLight.obj";
-
-    gTaxiLightObjectRelativePath =
-        MakePathRelativeToXPlaneRoot(taxiLightAbsolutePath);
-
-    if (gTaxiLightObjectRelativePath.empty())
-    {
-        LogMessage(
-            "AeroPath Traffic: Could not make taxi-light path relative to X-Plane root: %s",
-            taxiLightAbsolutePath.c_str());
-    }
-    else
-    {
-        LogMessage(
-            "AeroPath Traffic: Taxi-light object path '%s'",
-            gTaxiLightObjectRelativePath.c_str());
-    }
+    AeroPathTaxiGuidance::Initialise(resourcePath);
 
     const char* result =
         XPMPMultiplayerInit(
@@ -2320,8 +2072,7 @@ PLUGIN_API int XPluginEnable()
 
 PLUGIN_API void XPluginDisable()
 {
-    SetTaxiTestLightsVisible(false);
-    DestroyTaxiGuidanceResources();
+    AeroPathTaxiGuidance::Shutdown();
 
     XPLMUnregisterFlightLoopCallback(
         TrafficFileLoop,
