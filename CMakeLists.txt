@@ -29,7 +29,7 @@ else()
 endif()
 
 project(AeroPathTraffic
-        VERSION 3.1.2
+        VERSION 3.1.3
         DESCRIPTION "AeroPath multiplayer traffic plugin for X-Plane 12")
 
 message ("== Building: ${PROJECT_NAME} ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH} ==")

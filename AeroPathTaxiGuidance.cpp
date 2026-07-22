@@ -52,6 +52,8 @@ namespace
     constexpr double MAX_START_NODE_DISTANCE_METRES = 1500.0;
     constexpr double OFF_ROUTE_REBUILD_DISTANCE_METRES = 90.0;
     constexpr double ROUTE_COMPLETION_DISTANCE_METRES = 28.0;
+    constexpr double MAX_RAMP_NODE_DISTANCE_METRES = 350.0;
+    constexpr std::size_t MAX_RAMP_ROUTE_CANDIDATES = 40;
     constexpr long long CONFIG_STALE_AFTER_SECONDS = 35;
 
     struct GeoPoint
@@ -74,6 +76,12 @@ namespace
         std::string airport;
         std::string runway;
         std::string phase;
+        std::string direction = "out";
+        std::string aircraftIcao;
+        std::string aircraftWidth = "C";
+        std::string equipment = "jets";
+        std::string operation = "airline";
+        std::string airline;
         long long generatedUnix = 0;
         std::string contextKey;
         std::string rawContent;
@@ -104,6 +112,18 @@ namespace
         GeoPoint position;
     };
 
+    struct RampStart
+    {
+        GeoPoint position;
+        double heading = 0.0;
+        std::string locationType;
+        std::vector<std::string> equipment;
+        std::string name;
+        std::string widthCode;
+        std::string operation;
+        std::vector<std::string> airlines;
+    };
+
     struct AirportData
     {
         std::string identifier;
@@ -111,6 +131,7 @@ namespace
         std::unordered_map<int, TaxiNode> nodes;
         std::vector<TaxiEdge> edges;
         std::vector<RunwayEnd> runwayEnds;
+        std::vector<RampStart> rampStarts;
     };
 
     struct AdjacentNode
@@ -132,6 +153,8 @@ namespace
     std::string gLastConfigContent;
     std::string gActiveAirport;
     std::string gActiveRunway;
+    std::string gActiveStand;
+    std::string gActiveDirection = "out";
     std::string gActiveAptPath;
 
     double gLastConfigCheckSeconds = -1000.0;
@@ -227,6 +250,40 @@ namespace
         while (std::getline(stream, current, separator))
             parts.push_back(Trim(current));
         return parts;
+    }
+
+    std::vector<std::string> SplitLower(const std::string& value, char separator)
+    {
+        std::vector<std::string> parts;
+        for (const std::string& part : Split(value, separator))
+        {
+            const std::string clean = ToLower(Trim(part));
+            if (!clean.empty())
+                parts.push_back(clean);
+        }
+        return parts;
+    }
+
+    std::string NormaliseWidthCode(const std::string& value)
+    {
+        const std::string clean = ToUpper(Trim(value));
+        if (clean.size() == 1 && clean[0] >= 'A' && clean[0] <= 'F')
+            return clean;
+        return {};
+    }
+
+    int WidthRank(const std::string& value)
+    {
+        const std::string clean = NormaliseWidthCode(value);
+        return clean.empty() ? 0 : static_cast<int>(clean[0] - 'A' + 1);
+    }
+
+    bool ContainsToken(
+        const std::vector<std::string>& values,
+        const std::string& requested)
+    {
+        const std::string target = ToLower(Trim(requested));
+        return std::find(values.begin(), values.end(), target) != values.end();
     }
 
     bool ParseBool(const std::string& value, bool fallback)
@@ -504,12 +561,31 @@ namespace
 
             if (key == "enabled")
                 config.enabled = ParseBool(value, config.enabled);
-            else if (key == "airport" || key == "departure_icao")
+            else if (key == "airport" || key == "departure_icao" || key == "arrival_icao")
                 config.airport = ToUpper(value);
-            else if (key == "runway" || key == "departure_runway")
+            else if (key == "runway" || key == "departure_runway" || key == "arrival_runway")
                 config.runway = NormaliseRunway(value);
             else if (key == "phase")
                 config.phase = value;
+            else if (key == "direction")
+            {
+                const std::string direction = ToLower(value);
+                config.direction = direction == "in" ? "in" : "out";
+            }
+            else if (key == "aircraft_icao")
+                config.aircraftIcao = ToUpper(value);
+            else if (key == "aircraft_width")
+            {
+                const std::string width = NormaliseWidthCode(value);
+                if (!width.empty())
+                    config.aircraftWidth = width;
+            }
+            else if (key == "equipment")
+                config.equipment = ToLower(value);
+            else if (key == "operation")
+                config.operation = ToLower(value);
+            else if (key == "airline")
+                config.airline = ToUpper(value);
             else if (key == "generated_unix")
             {
                 try
@@ -527,7 +603,13 @@ namespace
             std::string(config.enabled ? "1" : "0") + "|" +
             ToUpper(config.airport) + "|" +
             NormaliseRunway(config.runway) + "|" +
-            ToLower(config.phase);
+            ToLower(config.phase) + "|" +
+            config.direction + "|" +
+            config.aircraftIcao + "|" +
+            config.aircraftWidth + "|" +
+            config.equipment + "|" +
+            config.operation + "|" +
+            config.airline;
 
         return config;
     }
@@ -726,6 +808,7 @@ namespace
         airport = AirportData{};
         airport.sourcePath = sourcePath;
         TaxiEdge* previousEdge = nullptr;
+        RampStart* previousRamp = nullptr;
 
         for (const std::string& line : lines)
         {
@@ -738,6 +821,7 @@ namespace
             {
                 airport.identifier = ToUpper(fields[4]);
                 previousEdge = nullptr;
+                previousRamp = nullptr;
                 continue;
             }
 
@@ -747,6 +831,7 @@ namespace
                 if (key == "icao_code" || key == "icao_id")
                     airport.identifier = ToUpper(fields[2]);
                 previousEdge = nullptr;
+                previousRamp = nullptr;
                 continue;
             }
 
@@ -767,6 +852,7 @@ namespace
                 }
 
                 previousEdge = nullptr;
+                previousRamp = nullptr;
                 continue;
             }
 
@@ -781,6 +867,7 @@ namespace
                     !ParseInt(fields[4], nodeId))
                 {
                     previousEdge = nullptr;
+                    previousRamp = nullptr;
                     continue;
                 }
 
@@ -798,6 +885,7 @@ namespace
 
                 airport.nodes[node.id] = node;
                 previousEdge = nullptr;
+                previousRamp = nullptr;
                 continue;
             }
 
@@ -807,6 +895,7 @@ namespace
                 if (!ParseInt(fields[1], edge.from) || !ParseInt(fields[2], edge.to))
                 {
                     previousEdge = nullptr;
+                    previousRamp = nullptr;
                     continue;
                 }
 
@@ -823,6 +912,7 @@ namespace
 
                 airport.edges.push_back(edge);
                 previousEdge = &airport.edges.back();
+                previousRamp = nullptr;
                 continue;
             }
 
@@ -837,7 +927,51 @@ namespace
                 continue;
             }
 
+            if (fields[0] == "1300" && fields.size() >= 7)
+            {
+                double latitude = 0.0;
+                double longitude = 0.0;
+                double heading = 0.0;
+
+                if (!ParseDouble(fields[1], latitude) ||
+                    !ParseDouble(fields[2], longitude) ||
+                    !ParseDouble(fields[3], heading))
+                {
+                    previousEdge = nullptr;
+                    previousRamp = nullptr;
+                    continue;
+                }
+
+                RampStart ramp;
+                ramp.position = {latitude, longitude};
+                ramp.heading = heading;
+                ramp.locationType = ToLower(fields[4]);
+                ramp.equipment = SplitLower(fields[5], '|');
+                ramp.name = fields[6];
+                for (std::size_t index = 7; index < fields.size(); ++index)
+                    ramp.name += " " + fields[index];
+
+                airport.rampStarts.push_back(std::move(ramp));
+                previousRamp = &airport.rampStarts.back();
+                previousEdge = nullptr;
+                continue;
+            }
+
+            if (fields[0] == "1301" && fields.size() >= 3 && previousRamp)
+            {
+                previousRamp->widthCode = NormaliseWidthCode(fields[1]);
+                previousRamp->operation = ToLower(fields[2]);
+                for (std::size_t index = 3; index < fields.size(); ++index)
+                {
+                    const std::string airline = ToUpper(Trim(fields[index]));
+                    if (!airline.empty())
+                        previousRamp->airlines.push_back(airline);
+                }
+                continue;
+            }
+
             previousEdge = nullptr;
+            previousRamp = nullptr;
         }
 
         return !airport.nodes.empty() && !airport.edges.empty() && !airport.runwayEnds.empty();
@@ -933,7 +1067,7 @@ namespace
             const bool targetRunwayEdge = EdgeTargetsRunway(edge, targetRunway);
 
             if (edge.runway && !targetRunwayEdge)
-                cost *= 4.0;
+                cost *= targetRunway.empty() ? 12.0 : 4.0;
             else if (edge.runway)
                 cost *= 1.15;
 
@@ -999,7 +1133,7 @@ namespace
         }
 
         path.assign(reversed.rbegin(), reversed.rend());
-        return path.size() >= 2;
+        return !path.empty();
     }
 
     double RouteLengthMetres(const std::vector<GeoPoint>& points)
@@ -1102,39 +1236,22 @@ namespace
         gUsingStraightFallback = true;
     }
 
-    bool BuildTaxiRoute(const TaxiConfig& config)
+    void BuildNoRoute()
     {
-        const GeoPoint aircraft = CurrentAircraftGeoPoint();
-        std::string airportIdentifier = ToUpper(Trim(config.airport));
-        if (airportIdentifier.empty())
-            airportIdentifier = DetectNearestAirport();
+        gRoutePoints.clear();
+        gRouteValid = false;
+        gUsingStraightFallback = false;
+        gRouteCompleted = true;
+        HideAllLights();
+    }
 
-        if (airportIdentifier.empty())
-        {
-            LogMessage("AeroPath Traffic: Taxi route could not identify the nearest airport");
-            BuildStraightFallback();
-            return false;
-        }
-
-        std::vector<std::string> airportBlock;
-        std::string aptPath;
-        if (!LoadEffectiveAirportBlock(airportIdentifier, airportBlock, aptPath))
-        {
-            LogMessage("AeroPath Traffic: No apt.dat airport block found for %s",
-                airportIdentifier.c_str());
-            BuildStraightFallback();
-            return false;
-        }
-
-        AirportData airport;
-        if (!ParseAirportData(airportBlock, aptPath, airport))
-        {
-            LogMessage("AeroPath Traffic: %s has no usable aircraft taxi network in '%s'",
-                airportIdentifier.c_str(), aptPath.c_str());
-            BuildStraightFallback();
-            return false;
-        }
-
+    bool BuildTaxiOutRoute(
+        const TaxiConfig& config,
+        const AirportData& airport,
+        const GeoPoint& aircraft,
+        const std::string& airportIdentifier,
+        const std::string& aptPath)
+    {
         const RunwayEnd* runwayEnd = SelectRunwayEnd(airport, config.runway, aircraft);
         if (!runwayEnd)
         {
@@ -1164,7 +1281,7 @@ namespace
         }
 
         double targetDistance = 0.0;
-        int targetNode = FindNearestNode(
+        const int targetNode = FindNearestNode(
             airport,
             runwayEnd->position,
             &targetDistance,
@@ -1215,10 +1332,12 @@ namespace
         gUsingStraightFallback = false;
         gActiveAirport = airportIdentifier;
         gActiveRunway = runwayEnd->identifier;
+        gActiveStand.clear();
+        gActiveDirection = "out";
         gActiveAptPath = aptPath;
 
         LogMessage(
-            "AeroPath Traffic: Taxi route ready %s -> RWY %s: %zu graph nodes, %.0f m, source '%s'",
+            "AeroPath Traffic: Taxi-out route ready %s -> RWY %s: %zu graph nodes, %.0f m, source '%s'",
             gActiveAirport.c_str(),
             gActiveRunway.c_str(),
             pathNodeIds.size(),
@@ -1226,6 +1345,352 @@ namespace
             gActiveAptPath.c_str());
 
         return true;
+    }
+
+    bool EquipmentMatches(
+        const RampStart& ramp,
+        const std::string& requestedEquipment,
+        double& penalty)
+    {
+        if (ramp.equipment.empty())
+        {
+            penalty += 15.0;
+            return true;
+        }
+
+        const std::string requested = ToLower(Trim(requestedEquipment));
+        if (ContainsToken(ramp.equipment, requested))
+            return true;
+
+        if (requested == "heavy" && ContainsToken(ramp.equipment, "jets"))
+        {
+            penalty += 20.0;
+            return true;
+        }
+
+        if (requested == "jets" && ContainsToken(ramp.equipment, "heavy"))
+        {
+            penalty += 30.0;
+            return true;
+        }
+
+        if (requested == "turboprops" && ContainsToken(ramp.equipment, "props"))
+        {
+            penalty += 18.0;
+            return true;
+        }
+
+        if (requested == "props" && ContainsToken(ramp.equipment, "turboprops"))
+        {
+            penalty += 18.0;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool RampSuitabilityPenalty(
+        const RampStart& ramp,
+        const TaxiConfig& config,
+        double& penalty)
+    {
+        penalty = 0.0;
+
+        const int requestedWidth = WidthRank(config.aircraftWidth);
+        const int rampWidth = WidthRank(ramp.widthCode);
+        if (rampWidth > 0 && requestedWidth > 0 && rampWidth < requestedWidth)
+            return false;
+
+        if (rampWidth == 0)
+            penalty += 35.0;
+        else if (requestedWidth > 0)
+            penalty += static_cast<double>(rampWidth - requestedWidth) * 22.0;
+
+        if (!EquipmentMatches(ramp, config.equipment, penalty))
+            return false;
+
+        const std::string requestedOperation = ToLower(Trim(config.operation));
+        const std::string rampOperation = ToLower(Trim(ramp.operation));
+        if (rampOperation.empty() || rampOperation == "none")
+        {
+            penalty += 15.0;
+        }
+        else if (rampOperation != requestedOperation)
+        {
+            if ((requestedOperation == "airline" && rampOperation == "cargo") ||
+                (requestedOperation == "cargo" && rampOperation == "airline"))
+            {
+                penalty += 45.0;
+            }
+            else if (requestedOperation == "general_aviation")
+            {
+                penalty += 100.0;
+            }
+            else if (rampOperation == "general_aviation")
+            {
+                penalty += 130.0;
+            }
+            else if (rampOperation == "military" || requestedOperation == "military")
+            {
+                return false;
+            }
+            else
+            {
+                penalty += 75.0;
+            }
+        }
+
+        const std::string locationType = ToLower(Trim(ramp.locationType));
+        if (requestedOperation == "general_aviation")
+        {
+            if (locationType == "tie-down")
+                penalty += 0.0;
+            else if (locationType == "hangar")
+                penalty += 8.0;
+            else if (locationType == "gate")
+                penalty += 55.0;
+            else
+                penalty += 100.0;
+        }
+        else
+        {
+            if (locationType == "gate")
+                penalty += 0.0;
+            else if (locationType == "tie-down")
+                penalty += 75.0;
+            else if (locationType == "hangar")
+                penalty += 100.0;
+            else
+                penalty += 140.0;
+        }
+
+        if (!ramp.airlines.empty())
+        {
+            if (!config.airline.empty() &&
+                std::find(ramp.airlines.begin(), ramp.airlines.end(), config.airline) !=
+                    ramp.airlines.end())
+            {
+                penalty -= 12.0;
+            }
+            else
+            {
+                penalty += 65.0;
+            }
+        }
+        else
+        {
+            penalty += 5.0;
+        }
+
+        return true;
+    }
+
+    struct RampRouteCandidate
+    {
+        const RampStart* ramp = nullptr;
+        double suitabilityPenalty = 0.0;
+        double directDistance = 0.0;
+    };
+
+    bool BuildTaxiInRoute(
+        const TaxiConfig& config,
+        const AirportData& airport,
+        const GeoPoint& aircraft,
+        const std::string& airportIdentifier,
+        const std::string& aptPath)
+    {
+        if (airport.rampStarts.empty())
+        {
+            LogMessage("AeroPath Traffic: %s has no ramp starts for taxi-in guidance",
+                airportIdentifier.c_str());
+            BuildNoRoute();
+            return false;
+        }
+
+        double startDistance = 0.0;
+        const int startNode = FindNearestNode(airport, aircraft, &startDistance);
+        if (startNode < 0 || startDistance > MAX_START_NODE_DISTANCE_METRES)
+        {
+            LogMessage("AeroPath Traffic: Nearest %s taxi node is %.0f m away; taxi-in route rejected",
+                airportIdentifier.c_str(), startDistance);
+            BuildNoRoute();
+            return false;
+        }
+
+        std::vector<RampRouteCandidate> candidates;
+        candidates.reserve(airport.rampStarts.size());
+        for (const RampStart& ramp : airport.rampStarts)
+        {
+            double penalty = 0.0;
+            if (!RampSuitabilityPenalty(ramp, config, penalty))
+                continue;
+
+            RampRouteCandidate candidate;
+            candidate.ramp = &ramp;
+            candidate.suitabilityPenalty = penalty;
+            candidate.directDistance = DistanceMetres(aircraft, ramp.position);
+            candidates.push_back(candidate);
+        }
+
+        std::sort(
+            candidates.begin(),
+            candidates.end(),
+            [](const RampRouteCandidate& first, const RampRouteCandidate& second)
+            {
+                const double firstScore =
+                    first.directDistance + first.suitabilityPenalty * 12.0;
+                const double secondScore =
+                    second.directDistance + second.suitabilityPenalty * 12.0;
+                return firstScore < secondScore;
+            });
+
+        if (candidates.size() > MAX_RAMP_ROUTE_CANDIDATES)
+            candidates.resize(MAX_RAMP_ROUTE_CANDIDATES);
+
+        const RampStart* bestRamp = nullptr;
+        std::vector<int> bestPath;
+        double bestScore = std::numeric_limits<double>::max();
+        double bestConnectorDistance = 0.0;
+
+        for (const RampRouteCandidate& candidate : candidates)
+        {
+            double connectorDistance = 0.0;
+            const int targetNode = FindNearestNode(
+                airport,
+                candidate.ramp->position,
+                &connectorDistance);
+
+            if (targetNode < 0 || connectorDistance > MAX_RAMP_NODE_DISTANCE_METRES)
+                continue;
+
+            std::vector<int> pathNodeIds;
+            if (!FindShortestPath(airport, startNode, targetNode, "", pathNodeIds))
+                continue;
+
+            std::vector<GeoPoint> scoredRoute;
+            scoredRoute.push_back(aircraft);
+            for (int nodeId : pathNodeIds)
+            {
+                const auto node = airport.nodes.find(nodeId);
+                if (node != airport.nodes.end())
+                    scoredRoute.push_back(node->second.position);
+            }
+            scoredRoute.push_back(candidate.ramp->position);
+
+            const double score =
+                RouteLengthMetres(scoredRoute) +
+                candidate.suitabilityPenalty * 15.0 +
+                connectorDistance * 1.5;
+
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestRamp = candidate.ramp;
+                bestPath = std::move(pathNodeIds);
+                bestConnectorDistance = connectorDistance;
+            }
+        }
+
+        if (!bestRamp)
+        {
+            LogMessage(
+                "AeroPath Traffic: No connected stand suitable for aircraft %s width %s at %s",
+                config.aircraftIcao.empty() ? "unknown" : config.aircraftIcao.c_str(),
+                config.aircraftWidth.c_str(),
+                airportIdentifier.c_str());
+            BuildNoRoute();
+            return false;
+        }
+
+        std::vector<GeoPoint> route;
+        route.push_back(aircraft);
+        for (int nodeId : bestPath)
+        {
+            const auto node = airport.nodes.find(nodeId);
+            if (node == airport.nodes.end())
+                continue;
+
+            if (route.empty() || DistanceMetres(route.back(), node->second.position) > 0.5)
+                route.push_back(node->second.position);
+        }
+
+        if (route.empty() || DistanceMetres(route.back(), bestRamp->position) > 0.5)
+            route.push_back(bestRamp->position);
+
+        if (route.size() < 2)
+        {
+            BuildNoRoute();
+            return false;
+        }
+
+        gRoutePoints = std::move(route);
+        gRouteValid = true;
+        gUsingStraightFallback = false;
+        gActiveAirport = airportIdentifier;
+        gActiveRunway = NormaliseRunway(config.runway);
+        gActiveStand = bestRamp->name;
+        gActiveDirection = "in";
+        gActiveAptPath = aptPath;
+
+        LogMessage(
+            "AeroPath Traffic: Taxi-in route ready %s -> stand %s for %s width %s: %zu graph nodes, %.0f m, connector %.0f m, source '%s'",
+            gActiveAirport.c_str(),
+            gActiveStand.c_str(),
+            config.aircraftIcao.empty() ? "aircraft" : config.aircraftIcao.c_str(),
+            config.aircraftWidth.c_str(),
+            bestPath.size(),
+            RouteLengthMetres(gRoutePoints),
+            bestConnectorDistance,
+            gActiveAptPath.c_str());
+
+        return true;
+    }
+
+    bool BuildTaxiRoute(const TaxiConfig& config)
+    {
+        const GeoPoint aircraft = CurrentAircraftGeoPoint();
+        std::string airportIdentifier = ToUpper(Trim(config.airport));
+        if (airportIdentifier.empty())
+            airportIdentifier = DetectNearestAirport();
+
+        if (airportIdentifier.empty())
+        {
+            LogMessage("AeroPath Traffic: Taxi route could not identify the nearest airport");
+            if (config.direction == "in")
+                BuildNoRoute();
+            else
+                BuildStraightFallback();
+            return false;
+        }
+
+        std::vector<std::string> airportBlock;
+        std::string aptPath;
+        if (!LoadEffectiveAirportBlock(airportIdentifier, airportBlock, aptPath))
+        {
+            LogMessage("AeroPath Traffic: No apt.dat airport block found for %s",
+                airportIdentifier.c_str());
+            if (config.direction == "in")
+                BuildNoRoute();
+            else
+                BuildStraightFallback();
+            return false;
+        }
+
+        AirportData airport;
+        if (!ParseAirportData(airportBlock, aptPath, airport))
+        {
+            LogMessage("AeroPath Traffic: %s has no usable aircraft taxi network in '%s'",
+                airportIdentifier.c_str(), aptPath.c_str());
+            if (config.direction == "in")
+                BuildNoRoute();
+            else
+                BuildStraightFallback();
+            return false;
+        }
+
+        return config.direction == "in"
+            ? BuildTaxiInRoute(config, airport, aircraft, airportIdentifier, aptPath)
+            : BuildTaxiOutRoute(config, airport, aircraft, airportIdentifier, aptPath);
     }
 
     std::vector<LocalPoint> BuildLocalRoute()
@@ -1410,9 +1875,18 @@ namespace
         {
             gRouteCompleted = true;
             HideAllLights();
-            LogMessage(
-                "AeroPath Traffic: Taxi route complete at runway %s; automatic lights hidden",
-                gActiveRunway.empty() ? "entry" : gActiveRunway.c_str());
+            if (gActiveDirection == "in")
+            {
+                LogMessage(
+                    "AeroPath Traffic: Taxi-in route complete at stand %s; automatic lights hidden",
+                    gActiveStand.empty() ? "selected" : gActiveStand.c_str());
+            }
+            else
+            {
+                LogMessage(
+                    "AeroPath Traffic: Taxi-out route complete at runway %s; automatic lights hidden",
+                    gActiveRunway.empty() ? "entry" : gActiveRunway.c_str());
+            }
             return;
         }
 
@@ -1515,6 +1989,8 @@ namespace AeroPathTaxiGuidance
         gLastConfigContent.clear();
         gActiveAirport.clear();
         gActiveRunway.clear();
+        gActiveStand.clear();
+        gActiveDirection = "out";
         gActiveAptPath.clear();
         DestroyResources();
     }

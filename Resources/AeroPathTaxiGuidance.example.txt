@@ -1,7 +1,14 @@
-# AeroPath X-Plane taxi guidance example
-# The desktop app creates AeroPathTaxiGuidance.txt automatically.
-version=1
+# AeroPath X-Plane taxi guidance
+version=3
 enabled=1
-airport=EGHI
-runway=20
-phase=Taxi Out
+direction=in
+airport=EGKK
+runway=26L
+phase=Taxi In
+aircraft_icao=B738
+aircraft_width=C
+equipment=jets
+operation=airline
+airline=RYR
+generated_at=2026-07-22T19:00:00.0000000Z
+generated_unix=1784746800
