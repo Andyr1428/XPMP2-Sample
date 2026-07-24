@@ -54,7 +54,9 @@ namespace
     constexpr double ROUTE_COMPLETION_DISTANCE_METRES = 28.0;
     constexpr double MAX_RAMP_NODE_DISTANCE_METRES = 350.0;
     constexpr std::size_t MAX_RAMP_ROUTE_CANDIDATES = 40;
-    constexpr long long CONFIG_STALE_AFTER_SECONDS = 35;
+    constexpr long long CONFIG_STALE_AFTER_SECONDS = 90;
+    constexpr long long CONFIG_FUTURE_TOLERANCE_SECONDS = 30;
+    constexpr double STALE_LOG_REPEAT_SECONDS = 30.0;
 
     struct GeoPoint
     {
@@ -159,6 +161,8 @@ namespace
 
     double gLastConfigCheckSeconds = -1000.0;
     double gLastRouteAttemptSeconds = -1000.0;
+    double gLastStaleLogSeconds = -1000.0;
+    long long gLastRejectedGeneratedUnix = std::numeric_limits<long long>::min();
 
     XPLMObjectRef gTaxiLightObject = nullptr;
     XPLMProbeRef gTerrainProbe = nullptr;
@@ -176,19 +180,28 @@ namespace
         return gManualVisible || gAutomaticVisible;
     }
 
-    bool IsConfigFresh(const TaxiConfig& config)
+    long long ConfigAgeSeconds(const TaxiConfig& config)
     {
-        // Automatic mode requires the Stage 3 desktop heartbeat. A Stage 2
-        // file can still be used through the manual menu option.
         if (config.generatedUnix <= 0)
-            return false;
+            return std::numeric_limits<long long>::max();
 
         const long long now = static_cast<long long>(std::time(nullptr));
         if (now <= 0)
-            return true;
+            return 0;
 
-        const long long age = now - config.generatedUnix;
-        return age >= -5 && age <= CONFIG_STALE_AFTER_SECONDS;
+        return now - config.generatedUnix;
+    }
+
+    bool IsConfigFresh(const TaxiConfig& config)
+    {
+        // Automatic mode requires the desktop heartbeat. A file without a
+        // heartbeat can still be used through the manual menu option.
+        if (config.generatedUnix <= 0)
+            return false;
+
+        const long long age = ConfigAgeSeconds(config);
+        return age >= -CONFIG_FUTURE_TOLERANCE_SECONDS &&
+               age <= CONFIG_STALE_AFTER_SECONDS;
     }
 
     void LogMessage(const char* format, ...)
@@ -200,6 +213,42 @@ namespace
         va_end(arguments);
         std::strcat(buffer, "\n");
         XPLMDebugString(buffer);
+    }
+
+    void LogRejectedAutomaticConfig(
+        const TaxiConfig& config,
+        double elapsedSeconds)
+    {
+        if (config.generatedUnix == gLastRejectedGeneratedUnix &&
+            elapsedSeconds - gLastStaleLogSeconds < STALE_LOG_REPEAT_SECONDS)
+        {
+            return;
+        }
+
+        gLastRejectedGeneratedUnix = config.generatedUnix;
+        gLastStaleLogSeconds = elapsedSeconds;
+
+        if (config.generatedUnix <= 0)
+        {
+            LogMessage(
+                "AeroPath Traffic: Automatic taxi guidance rejected because generated_unix is missing");
+            return;
+        }
+
+        const long long age = ConfigAgeSeconds(config);
+        if (age < -CONFIG_FUTURE_TOLERANCE_SECONDS)
+        {
+            LogMessage(
+                "AeroPath Traffic: Automatic taxi guidance rejected because heartbeat is %lld s in the future (tolerance %lld s)",
+                -age,
+                CONFIG_FUTURE_TOLERANCE_SECONDS);
+            return;
+        }
+
+        LogMessage(
+            "AeroPath Traffic: Automatic taxi guidance rejected as stale: heartbeat age %lld s (limit %lld s)",
+            age,
+            CONFIG_STALE_AFTER_SECONDS);
     }
 
     std::string Trim(const std::string& value)
@@ -2010,6 +2059,8 @@ namespace AeroPathTaxiGuidance
         gActiveStand.clear();
         gActiveDirection = "out";
         gActiveAptPath.clear();
+        gLastStaleLogSeconds = -1000.0;
+        gLastRejectedGeneratedUnix = std::numeric_limits<long long>::min();
         DestroyResources();
     }
 
@@ -2092,10 +2143,14 @@ namespace AeroPathTaxiGuidance
         {
             gLastConfigCheckSeconds = now;
             const TaxiConfig config = ReadConfig();
+            const bool configFresh = IsConfigFresh(config);
             const bool automaticRequested =
                 config.filePresent &&
                 config.enabled &&
-                IsConfigFresh(config);
+                configFresh;
+
+            if (config.filePresent && config.enabled && !configFresh)
+                LogRejectedAutomaticConfig(config, now);
 
             if (automaticRequested != gAutomaticVisible)
             {
