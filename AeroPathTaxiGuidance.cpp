@@ -684,6 +684,15 @@ namespace
             if (packPath.empty())
                 continue;
 
+            // X-Plane 12 can use special scenery_packs.ini tokens such as
+            // *GLOBAL_AIRPORTS*. They are not filesystem paths; the actual
+            // Global Airports apt.dat is added explicitly below.
+            if (packPath.size() >= 2 &&
+                packPath.front() == '*' && packPath.back() == '*')
+            {
+                continue;
+            }
+
             std::replace(packPath.begin(), packPath.end(), '/', separator);
             std::replace(packPath.begin(), packPath.end(), '\\', separator);
 
@@ -698,6 +707,10 @@ namespace
             addCandidate(JoinPath(absolutePack, "Earth nav data/apt.dat"));
         }
 
+        // X-Plane 12 stores the effective Global Airports apt.dat here.
+        // Keep the older locations afterwards for X-Plane 11 / legacy installs.
+        addCandidate(JoinPath(xPlaneRoot,
+            "Global Scenery/Global Airports/Earth nav data/apt.dat"));
         addCandidate(JoinPath(xPlaneRoot,
             "Custom Scenery/Global Airports/Earth nav data/apt.dat"));
         addCandidate(JoinPath(xPlaneRoot,
@@ -1231,9 +1244,14 @@ namespace
 
     void BuildStraightFallback()
     {
+        // A straight line based only on aircraft heading can cross grass,
+        // buildings, stands and runways. Taxi guidance must only be shown
+        // when a valid apt.dat taxi-network route has been built.
         gRoutePoints.clear();
         gRouteValid = false;
-        gUsingStraightFallback = true;
+        gUsingStraightFallback = false;
+        gRouteCompleted = true;
+        HideAllLights();
     }
 
     void BuildNoRoute()
