@@ -52,6 +52,7 @@ namespace
     constexpr double PI = 3.141592653589793238462643383279502884;
     constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.25f;
     constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
+    constexpr double TRAFFIC_FILE_GRACE_SECONDS = 2.0;
     constexpr double MIN_INTERPOLATION_SECONDS = 0.20;
     constexpr double DEFAULT_INTERPOLATION_SECONDS = 1.00;
     constexpr double MAX_INTERPOLATION_SECONDS = 5.00;
@@ -65,6 +66,7 @@ namespace
     bool gFeedEnabled = true;
     bool gFeedFilePreviouslyMissing = false;
     bool gFeedFilePreviouslyStale = false;
+    double gFeedUnavailableSinceSeconds = -1.0;
 
 
     XPLMDataRef gLocalX = nullptr;
@@ -758,6 +760,33 @@ public:
         }
 
         /*
+         * An exact aircraft type is always safer than suppressing the traffic
+         * completely. If the requested operator is unavailable, retain the
+         * exact type even when XPMP2 selected another airline paint.
+         */
+        if (sameCode(
+                modelInfo.icaoType,
+                state_.icaoType))
+        {
+            SetRender(true);
+
+            LogMessage(
+                "AeroPath Traffic: Exact-type fallback accepted for '%s': requested %s/%s/%s -> %s/%s using '%s' (quality %d)",
+                state_.callsign.c_str(),
+                state_.icaoType.c_str(),
+                state_.airline.c_str(),
+                state_.livery.c_str(),
+                modelInfo.icaoType.c_str(),
+                selectedModelAirline.empty()
+                    ? "generic"
+                    : selectedModelAirline.c_str(),
+                modelInfo.modelName.c_str(),
+                selectedMatchQuality);
+
+            return;
+        }
+
+        /*
          * Remove any descriptive livery text and retry the exact airline. CSL
          * packages primarily identify operators using the three-letter ICAO
          * airline code.
@@ -788,6 +817,27 @@ public:
                     state_.airline.c_str(),
                     modelInfo.icaoType.c_str(),
                     selectedModelAirline.c_str(),
+                    modelInfo.modelName.c_str(),
+                    selectedMatchQuality);
+
+                return;
+            }
+
+            if (sameCode(
+                    modelInfo.icaoType,
+                    state_.icaoType))
+            {
+                SetRender(true);
+
+                LogMessage(
+                    "AeroPath Traffic: Exact-type airline fallback accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)",
+                    state_.callsign.c_str(),
+                    state_.icaoType.c_str(),
+                    state_.airline.c_str(),
+                    modelInfo.icaoType.c_str(),
+                    selectedModelAirline.empty()
+                        ? "generic"
+                        : selectedModelAirline.c_str(),
                     modelInfo.modelName.c_str(),
                     selectedMatchQuality);
 
@@ -825,17 +875,23 @@ public:
         const bool fallbackGeneric =
             !modelHasAnyAirline(modelInfo);
 
-        if (fallbackAcceptableShape &&
-            fallbackGeneric)
+        if (fallbackExactAircraft ||
+            (fallbackAcceptableShape &&
+             fallbackGeneric))
         {
             SetRender(true);
 
             LogMessage(
-                "AeroPath Traffic: Generic type fallback accepted for '%s': requested %s/%s -> %s using '%s' (quality %d)",
+                fallbackExactAircraft
+                    ? "AeroPath Traffic: Exact-type final fallback accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)"
+                    : "AeroPath Traffic: Generic family fallback accepted for '%s': requested %s/%s -> %s/%s using '%s' (quality %d)",
                 state_.callsign.c_str(),
                 state_.icaoType.c_str(),
                 state_.airline.c_str(),
                 modelInfo.icaoType.c_str(),
+                selectedModelAirline.empty()
+                    ? "generic"
+                    : selectedModelAirline.c_str(),
                 modelInfo.modelName.c_str(),
                 selectedMatchQuality);
 
@@ -1721,9 +1777,46 @@ namespace
 
         if (!ReadTrafficFile(parsedFeed))
         {
+            const double nowSeconds = XPLMGetElapsedTime();
+
+            if (gFeedUnavailableSinceSeconds < 0.0)
+                gFeedUnavailableSinceSeconds = nowSeconds;
+
+            const double unavailableSeconds =
+                nowSeconds - gFeedUnavailableSinceSeconds;
+
+            /*
+             * AeroPath Desktop replaces the feed atomically. On Windows there
+             * can be a very short interval where the old file has gone and the
+             * new file is not visible yet. Retain existing aircraft through
+             * that transient gap instead of destroying and recreating them.
+             */
+            if (!gRemoteAircraft.empty() &&
+                unavailableSeconds < TRAFFIC_FILE_GRACE_SECONDS)
+            {
+                return;
+            }
+
             gFeedEnabled = false;
             RemoveAllAircraft();
             return;
+        }
+
+        if (gFeedUnavailableSinceSeconds >= 0.0)
+        {
+            const double unavailableSeconds =
+                XPLMGetElapsedTime() -
+                gFeedUnavailableSinceSeconds;
+
+            if (!gRemoteAircraft.empty() &&
+                unavailableSeconds < TRAFFIC_FILE_GRACE_SECONDS)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Feed recovered after %.2f s; existing aircraft retained",
+                    unavailableSeconds);
+            }
+
+            gFeedUnavailableSinceSeconds = -1.0;
         }
 
         SynchroniseAircraft(parsedFeed);
@@ -2053,6 +2146,7 @@ PLUGIN_API int XPluginEnable()
         nullptr);
 
     gFeedEnabled = true;
+    gFeedUnavailableSinceSeconds = -1.0;
     gLastReportedTrafficCount = static_cast<std::size_t>(-1);
 
     ReloadTrafficFeed();
@@ -2074,6 +2168,7 @@ PLUGIN_API int XPluginEnable()
 PLUGIN_API void XPluginDisable()
 {
     AeroPathTaxiGuidance::Shutdown();
+    gFeedUnavailableSinceSeconds = -1.0;
 
     XPLMUnregisterFlightLoopCallback(
         TrafficFileLoop,

@@ -54,6 +54,11 @@ namespace
     constexpr double ROUTE_COMPLETION_DISTANCE_METRES = 28.0;
     constexpr double MAX_RAMP_NODE_DISTANCE_METRES = 350.0;
     constexpr std::size_t MAX_RAMP_ROUTE_CANDIDATES = 40;
+    constexpr double START_NODE_CANDIDATE_RADIUS_METRES = 220.0;
+    constexpr std::size_t MAX_START_NODE_CANDIDATES = 24;
+    constexpr double ROUTE_BEHIND_REBUILD_THRESHOLD_DEGREES = 100.0;
+    constexpr double ROUTE_BEHIND_CONFIRM_SECONDS = 2.0;
+    constexpr double ROUTE_HEADING_LOOKAHEAD_METRES = 30.0;
     constexpr long long CONFIG_STALE_AFTER_SECONDS = 90;
     constexpr long long CONFIG_FUTURE_TOLERANCE_SECONDS = 30;
     constexpr double STALE_LOG_REPEAT_SECONDS = 30.0;
@@ -162,6 +167,7 @@ namespace
     double gLastConfigCheckSeconds = -1000.0;
     double gLastRouteAttemptSeconds = -1000.0;
     double gLastStaleLogSeconds = -1000.0;
+    double gRouteBehindSinceSeconds = -1.0;
     long long gLastRejectedGeneratedUnix = std::numeric_limits<long long>::min();
 
     XPLMObjectRef gTaxiLightObject = nullptr;
@@ -395,6 +401,37 @@ namespace
         if (heading < 0.0)
             heading += 360.0;
         return heading;
+    }
+
+    double HeadingDifferenceDegrees(double first, double second)
+    {
+        const double difference = std::abs(
+            NormaliseHeading(first) -
+            NormaliseHeading(second));
+
+        return std::min(difference, 360.0 - difference);
+    }
+
+    double BearingDegrees(const GeoPoint& first, const GeoPoint& second)
+    {
+        const double firstLatitude = DegreesToRadians(first.latitude);
+        const double secondLatitude = DegreesToRadians(second.latitude);
+        const double longitudeDifference =
+            DegreesToRadians(second.longitude - first.longitude);
+
+        const double y =
+            std::sin(longitudeDifference) *
+            std::cos(secondLatitude);
+
+        const double x =
+            std::cos(firstLatitude) *
+            std::sin(secondLatitude) -
+            std::sin(firstLatitude) *
+            std::cos(secondLatitude) *
+            std::cos(longitudeDifference);
+
+        return NormaliseHeading(
+            RadiansToDegrees(std::atan2(y, x)));
     }
 
     std::string NormalisePathForComparison(std::string value)
@@ -1206,6 +1243,143 @@ namespace
         return length;
     }
 
+    struct StartRouteSelection
+    {
+        int startNode = -1;
+        double connectorDistance = 0.0;
+        double initialHeadingDifference = 180.0;
+        double score = std::numeric_limits<double>::max();
+        std::vector<int> pathNodeIds;
+    };
+
+    bool SelectTaxiOutStartRoute(
+        const AirportData& airport,
+        const GeoPoint& aircraft,
+        int targetNode,
+        const std::string& targetRunway,
+        StartRouteSelection& selection)
+    {
+        struct StartCandidate
+        {
+            int nodeId = -1;
+            double distance = 0.0;
+        };
+
+        std::vector<StartCandidate> candidates;
+        candidates.reserve(airport.nodes.size());
+
+        int nearestNode = -1;
+        double nearestDistance = std::numeric_limits<double>::max();
+
+        for (const auto& entry : airport.nodes)
+        {
+            const double distance =
+                DistanceMetres(aircraft, entry.second.position);
+
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearestNode = entry.first;
+            }
+
+            if (distance <= START_NODE_CANDIDATE_RADIUS_METRES)
+                candidates.push_back({entry.first, distance});
+        }
+
+        if (nearestNode < 0 ||
+            nearestDistance > MAX_START_NODE_DISTANCE_METRES)
+        {
+            return false;
+        }
+
+        if (candidates.empty())
+            candidates.push_back({nearestNode, nearestDistance});
+
+        std::sort(
+            candidates.begin(),
+            candidates.end(),
+            [](const StartCandidate& first, const StartCandidate& second)
+            {
+                return first.distance < second.distance;
+            });
+
+        if (candidates.size() > MAX_START_NODE_CANDIDATES)
+            candidates.resize(MAX_START_NODE_CANDIDATES);
+
+        const double aircraftHeading =
+            gHeading
+                ? NormaliseHeading(XPLMGetDataf(gHeading))
+                : 0.0;
+
+        for (const StartCandidate& candidate : candidates)
+        {
+            std::vector<int> pathNodeIds;
+            if (!FindShortestPath(
+                    airport,
+                    candidate.nodeId,
+                    targetNode,
+                    targetRunway,
+                    pathNodeIds))
+            {
+                continue;
+            }
+
+            std::vector<GeoPoint> route;
+            route.push_back(aircraft);
+
+            for (int nodeId : pathNodeIds)
+            {
+                const auto node = airport.nodes.find(nodeId);
+                if (node == airport.nodes.end())
+                    continue;
+
+                if (DistanceMetres(route.back(), node->second.position) > 0.5)
+                    route.push_back(node->second.position);
+            }
+
+            if (route.size() < 2)
+                continue;
+
+            std::size_t headingPointIndex = 1;
+            while (headingPointIndex + 1 < route.size() &&
+                   DistanceMetres(aircraft, route[headingPointIndex]) < 8.0)
+            {
+                ++headingPointIndex;
+            }
+
+            const double initialRouteHeading =
+                BearingDegrees(aircraft, route[headingPointIndex]);
+
+            const double headingDifference =
+                HeadingDifferenceDegrees(
+                    aircraftHeading,
+                    initialRouteHeading);
+
+            double score =
+                RouteLengthMetres(route) +
+                candidate.distance * 1.5 +
+                headingDifference * 8.0;
+
+            if (headingDifference >
+                ROUTE_BEHIND_REBUILD_THRESHOLD_DEGREES)
+            {
+                score += 900.0;
+            }
+
+            if (score < selection.score)
+            {
+                selection.startNode = candidate.nodeId;
+                selection.connectorDistance = candidate.distance;
+                selection.initialHeadingDifference = headingDifference;
+                selection.score = score;
+                selection.pathNodeIds = std::move(pathNodeIds);
+            }
+        }
+
+        return selection.startNode >= 0 &&
+               !selection.pathNodeIds.empty();
+    }
+
     void DestroyInstances()
     {
         for (XPLMInstanceRef instance : gLightInstances)
@@ -1294,21 +1468,26 @@ namespace
     void BuildStraightFallback()
     {
         // A straight line based only on aircraft heading can cross grass,
-        // buildings, stands and runways. Taxi guidance must only be shown
-        // when a valid apt.dat taxi-network route has been built.
+        // buildings, stands and runways. Keep the lights hidden and allow the
+        // normal retry loop to build a valid taxi-network route.
         gRoutePoints.clear();
         gRouteValid = false;
         gUsingStraightFallback = false;
-        gRouteCompleted = true;
+        gRouteCompleted = false;
+        gRouteBehindSinceSeconds = -1.0;
         HideAllLights();
     }
 
     void BuildNoRoute()
     {
+        // A route can fail temporarily while the aircraft is still on the
+        // runway, pushback is in progress, or the nearest taxi node changes.
+        // Do not mark it complete: retry from the live aircraft position.
         gRoutePoints.clear();
         gRouteValid = false;
         gUsingStraightFallback = false;
-        gRouteCompleted = true;
+        gRouteCompleted = false;
+        gRouteBehindSinceSeconds = -1.0;
         HideAllLights();
     }
 
@@ -1323,16 +1502,6 @@ namespace
         if (!runwayEnd)
         {
             LogMessage("AeroPath Traffic: %s has no usable runway ends", airportIdentifier.c_str());
-            BuildStraightFallback();
-            return false;
-        }
-
-        double startDistance = 0.0;
-        const int startNode = FindNearestNode(airport, aircraft, &startDistance);
-        if (startNode < 0 || startDistance > MAX_START_NODE_DISTANCE_METRES)
-        {
-            LogMessage("AeroPath Traffic: Nearest %s taxi node is %.0f m away; route rejected",
-                airportIdentifier.c_str(), startDistance);
             BuildStraightFallback();
             return false;
         }
@@ -1362,29 +1531,37 @@ namespace
             return false;
         }
 
-        std::vector<int> pathNodeIds;
-        if (!FindShortestPath(
+        StartRouteSelection startSelection;
+        if (!SelectTaxiOutStartRoute(
                 airport,
-                startNode,
+                aircraft,
                 targetNode,
                 runwayEnd->identifier,
-                pathNodeIds))
+                startSelection))
         {
-            LogMessage("AeroPath Traffic: No connected taxi path from the aircraft to %s runway %s",
-                airportIdentifier.c_str(), runwayEnd->identifier.c_str());
+            double nearestDistance = 0.0;
+            FindNearestNode(airport, aircraft, &nearestDistance);
+
+            LogMessage(
+                "AeroPath Traffic: No connected heading-aware taxi path from the aircraft to %s runway %s; nearest node %.0f m",
+                airportIdentifier.c_str(),
+                runwayEnd->identifier.c_str(),
+                nearestDistance);
+
             BuildStraightFallback();
             return false;
         }
 
         std::vector<GeoPoint> route;
         route.push_back(aircraft);
-        for (int nodeId : pathNodeIds)
+
+        for (int nodeId : startSelection.pathNodeIds)
         {
             const auto node = airport.nodes.find(nodeId);
             if (node == airport.nodes.end())
                 continue;
 
-            if (route.empty() || DistanceMetres(route.back(), node->second.position) > 0.5)
+            if (DistanceMetres(route.back(), node->second.position) > 0.5)
                 route.push_back(node->second.position);
         }
 
@@ -1397,6 +1574,8 @@ namespace
         gRoutePoints = std::move(route);
         gRouteValid = true;
         gUsingStraightFallback = false;
+        gRouteCompleted = false;
+        gRouteBehindSinceSeconds = -1.0;
         gActiveAirport = airportIdentifier;
         gActiveRunway = runwayEnd->identifier;
         gActiveStand.clear();
@@ -1404,11 +1583,13 @@ namespace
         gActiveAptPath = aptPath;
 
         LogMessage(
-            "AeroPath Traffic: Taxi-out route ready %s -> RWY %s: %zu graph nodes, %.0f m, source '%s'",
+            "AeroPath Traffic: Taxi-out route ready %s -> RWY %s: %zu graph nodes, %.0f m, start connector %.0f m, heading difference %.0f deg, source '%s'",
             gActiveAirport.c_str(),
             gActiveRunway.c_str(),
-            pathNodeIds.size(),
+            startSelection.pathNodeIds.size(),
             RouteLengthMetres(gRoutePoints),
+            startSelection.connectorDistance,
+            startSelection.initialHeadingDifference,
             gActiveAptPath.c_str());
 
         return true;
@@ -1693,6 +1874,8 @@ namespace
         gRoutePoints = std::move(route);
         gRouteValid = true;
         gUsingStraightFallback = false;
+        gRouteCompleted = false;
+        gRouteBehindSinceSeconds = -1.0;
         gActiveAirport = airportIdentifier;
         gActiveRunway = NormaliseRunway(config.runway);
         gActiveStand = bestRamp->name;
@@ -1916,14 +2099,14 @@ namespace
     {
         if (!gRouteValid || gRoutePoints.size() < 2)
         {
-            UpdateStraightFallback();
+            HideAllLights();
             return;
         }
 
         const std::vector<LocalPoint> route = BuildLocalRoute();
         if (route.size() < 2)
         {
-            UpdateStraightFallback();
+            HideAllLights();
             return;
         }
 
@@ -1957,11 +2140,78 @@ namespace
             return;
         }
 
+        const double elapsedSeconds = XPLMGetElapsedTime();
+
         if (projection.distanceFromRoute > OFF_ROUTE_REBUILD_DISTANCE_METRES &&
-            XPLMGetElapsedTime() - gLastRouteAttemptSeconds > ROUTE_RETRY_INTERVAL_SECONDS)
+            elapsedSeconds - gLastRouteAttemptSeconds > ROUTE_RETRY_INTERVAL_SECONDS)
         {
+            LogMessage(
+                "AeroPath Traffic: Aircraft is %.0f m off the taxi route; rebuilding from current position",
+                projection.distanceFromRoute);
+
+            gRouteBehindSinceSeconds = -1.0;
             AeroPathTaxiGuidance::RebuildRoute();
             return;
+        }
+
+        LocalPoint headingPoint;
+        double routeHeading = 0.0;
+        const double routeLength = LocalRouteLength(route);
+        const double headingCheckDistance =
+            std::min(
+                projection.alongDistance +
+                    ROUTE_HEADING_LOOKAHEAD_METRES,
+                std::max(
+                    projection.alongDistance,
+                    routeLength - 0.5));
+
+        const bool routeHeadingAvailable =
+            remainingDistance >
+                ROUTE_HEADING_LOOKAHEAD_METRES &&
+            PointAtRouteDistance(
+                route,
+                headingCheckDistance,
+                headingPoint,
+                routeHeading);
+
+        if (routeHeadingAvailable)
+        {
+            const double aircraftHeading =
+                NormaliseHeading(XPLMGetDataf(gHeading));
+
+            const double headingDifference =
+                HeadingDifferenceDegrees(
+                    aircraftHeading,
+                    routeHeading);
+
+            if (headingDifference >=
+                ROUTE_BEHIND_REBUILD_THRESHOLD_DEGREES)
+            {
+                if (gRouteBehindSinceSeconds < 0.0)
+                    gRouteBehindSinceSeconds = elapsedSeconds;
+
+                if (elapsedSeconds - gRouteBehindSinceSeconds >=
+                        ROUTE_BEHIND_CONFIRM_SECONDS &&
+                    elapsedSeconds - gLastRouteAttemptSeconds >
+                        ROUTE_RETRY_INTERVAL_SECONDS)
+                {
+                    LogMessage(
+                        "AeroPath Traffic: Taxi route is %.0f deg behind the aircraft heading; rebuilding dynamically",
+                        headingDifference);
+
+                    gRouteBehindSinceSeconds = -1.0;
+                    AeroPathTaxiGuidance::RebuildRoute();
+                    return;
+                }
+            }
+            else
+            {
+                gRouteBehindSinceSeconds = -1.0;
+            }
+        }
+        else
+        {
+            gRouteBehindSinceSeconds = -1.0;
         }
 
         float unusedData = 0.0f;
@@ -2061,6 +2311,7 @@ namespace AeroPathTaxiGuidance
         gActiveAptPath.clear();
         gLastStaleLogSeconds = -1000.0;
         gLastRejectedGeneratedUnix = std::numeric_limits<long long>::min();
+        gRouteBehindSinceSeconds = -1.0;
         DestroyResources();
     }
 
@@ -2117,6 +2368,7 @@ namespace AeroPathTaxiGuidance
             return;
 
         gLastRouteAttemptSeconds = XPLMGetElapsedTime();
+        gRouteBehindSinceSeconds = -1.0;
         const TaxiConfig config = ReadConfig();
         gLastConfigContent = config.contextKey;
         gRouteCompleted = false;
