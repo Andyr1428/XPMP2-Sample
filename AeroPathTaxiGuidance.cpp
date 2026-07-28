@@ -880,25 +880,6 @@ namespace
         return processCurrent();
     }
 
-    bool LoadEffectiveAirportBlock(
-        const std::string& airportIdentifier,
-        std::vector<std::string>& blockLines,
-        std::string& sourcePath)
-    {
-        const std::vector<std::string> candidates = BuildAptDataCandidates();
-
-        for (const std::string& candidate : candidates)
-        {
-            if (FindAirportBlock(candidate, airportIdentifier, blockLines))
-            {
-                sourcePath = candidate;
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     bool ParseAirportData(
         const std::vector<std::string>& lines,
         const std::string& sourcePath,
@@ -1074,6 +1055,70 @@ namespace
         }
 
         return !airport.nodes.empty() && !airport.edges.empty() && !airport.runwayEnds.empty();
+    }
+
+    bool LoadEffectiveAirportData(
+        const std::string& airportIdentifier,
+        AirportData& airport,
+        std::string& sourcePath)
+    {
+        const std::vector<std::string> candidates =
+            BuildAptDataCandidates();
+
+        bool airportBlockFound = false;
+        bool higherPriorityNetworkRejected = false;
+
+        for (const std::string& candidate : candidates)
+        {
+            std::vector<std::string> blockLines;
+            if (!FindAirportBlock(
+                    candidate,
+                    airportIdentifier,
+                    blockLines))
+            {
+                continue;
+            }
+
+            airportBlockFound = true;
+
+            AirportData candidateAirport;
+            if (!ParseAirportData(
+                    blockLines,
+                    candidate,
+                    candidateAirport))
+            {
+                higherPriorityNetworkRejected = true;
+
+                LogMessage(
+                    "AeroPath Traffic: %s has no usable aircraft taxi network in '%s'; checking lower-priority scenery",
+                    airportIdentifier.c_str(),
+                    candidate.c_str());
+
+                continue;
+            }
+
+            airport = std::move(candidateAirport);
+            sourcePath = candidate;
+
+            if (higherPriorityNetworkRejected)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Using lower-priority aircraft taxi network for %s from '%s'",
+                    airportIdentifier.c_str(),
+                    sourcePath.c_str());
+            }
+
+            return true;
+        }
+
+        if (airportBlockFound)
+        {
+            LogMessage(
+                "AeroPath Traffic: Airport blocks were found for %s, but none contained a usable aircraft taxi network",
+                airportIdentifier.c_str());
+        }
+
+        return false;
     }
 
     const RunwayEnd* SelectRunwayEnd(
@@ -1913,28 +1958,22 @@ namespace
             return false;
         }
 
-        std::vector<std::string> airportBlock;
-        std::string aptPath;
-        if (!LoadEffectiveAirportBlock(airportIdentifier, airportBlock, aptPath))
-        {
-            LogMessage("AeroPath Traffic: No apt.dat airport block found for %s",
-                airportIdentifier.c_str());
-            if (config.direction == "in")
-                BuildNoRoute();
-            else
-                BuildStraightFallback();
-            return false;
-        }
-
         AirportData airport;
-        if (!ParseAirportData(airportBlock, aptPath, airport))
+        std::string aptPath;
+        if (!LoadEffectiveAirportData(
+                airportIdentifier,
+                airport,
+                aptPath))
         {
-            LogMessage("AeroPath Traffic: %s has no usable aircraft taxi network in '%s'",
-                airportIdentifier.c_str(), aptPath.c_str());
+            LogMessage(
+                "AeroPath Traffic: No usable apt.dat aircraft taxi network found for %s",
+                airportIdentifier.c_str());
+
             if (config.direction == "in")
                 BuildNoRoute();
             else
                 BuildStraightFallback();
+
             return false;
         }
 
