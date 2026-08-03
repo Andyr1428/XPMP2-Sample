@@ -5,5 +5,5 @@ OBJ
 TEXTURE AeroPathTaxiLight.png
 POINT_COUNTS 0 0 0 0
 
-# Dark-blue AeroPath progressive taxi guidance marker with stronger daylight contrast.
-LIGHT_CUSTOM 0.0 0.0 0.0 0.00 0.07 0.60 1.00 4.25 0.0 0.0 1.0 1.0 NULL
+# High-visibility aviation-green AeroPath progressive taxi guidance marker.
+LIGHT_CUSTOM 0.0 0.0 0.0 0.05 1.00 0.12 1.00 5.25 0.0 0.0 1.0 1.0 NULL
