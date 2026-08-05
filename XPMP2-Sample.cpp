@@ -50,12 +50,14 @@ using namespace XPMP2;
 namespace
 {
     constexpr double PI = 3.141592653589793238462643383279502884;
-    constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.25f;
+    constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.10f;
     constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
     constexpr double TRAFFIC_FILE_GRACE_SECONDS = 2.0;
-    constexpr double MIN_INTERPOLATION_SECONDS = 0.20;
-    constexpr double DEFAULT_INTERPOLATION_SECONDS = 1.00;
-    constexpr double MAX_INTERPOLATION_SECONDS = 5.00;
+    constexpr double MIN_INTERPOLATION_SECONDS = 0.12;
+    constexpr double DEFAULT_INTERPOLATION_SECONDS = 0.30;
+    constexpr double MAX_INTERPOLATION_SECONDS = 1.50;
+    constexpr double INTERPOLATION_BUFFER_FACTOR = 1.35;
+    constexpr double TIMING_LOG_INTERVAL_SECONDS = 10.0;
     constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
 
 
@@ -76,6 +78,12 @@ namespace
 
     std::string gTrafficFilePath;
     std::size_t gLastReportedTrafficCount = static_cast<std::size_t>(-1);
+    std::string gLastProcessedFeedGeneration;
+    double gLastNewFeedSeconds = -1.0;
+    double gLastFeedIntervalSeconds = 0.0;
+    double gLastTimingLogSeconds = 0.0;
+    std::uint64_t gXpmpPositionUpdateCount = 0;
+    std::uint64_t gLastXpmpPositionUpdateCount = 0;
 
     struct LocalPosition
     {
@@ -134,6 +142,7 @@ namespace
     struct ParsedTrafficFeed
     {
         bool enabled = true;
+        std::string generatedAt;
         std::unordered_map<std::string, TrafficState> aircraft;
     };
 
@@ -515,7 +524,8 @@ public:
             interpolationTo_ = nextState;
             interpolationStartSeconds_ = nowSeconds;
             interpolationDurationSeconds_ = std::clamp(
-                observedIntervalSeconds,
+                observedIntervalSeconds *
+                    INTERPOLATION_BUFFER_FACTOR,
                 MIN_INTERPOLATION_SECONDS,
                 MAX_INTERPOLATION_SECONDS);
 
@@ -913,6 +923,8 @@ public:
 
     void UpdatePosition(float, int) override
     {
+        ++gXpmpPositionUpdateCount;
+
         const TrafficState state =
             BuildInterpolatedState(
                 XPLMGetElapsedTime());
@@ -1622,9 +1634,15 @@ namespace
             }
 
             if (!insideAircraftBlock &&
+                key == "generated_at")
+            {
+                parsedFeed.generatedAt = value;
+                continue;
+            }
+
+            if (!insideAircraftBlock &&
                 (key == "version" ||
-                 key == "count" ||
-                 key == "generated_at"))
+                 key == "count"))
             {
                 continue;
             }
@@ -1819,6 +1837,25 @@ namespace
             gFeedUnavailableSinceSeconds = -1.0;
         }
 
+        const double nowSeconds =
+            XPLMGetElapsedTime();
+
+        if (!parsedFeed.generatedAt.empty() &&
+            parsedFeed.generatedAt !=
+                gLastProcessedFeedGeneration)
+        {
+            if (gLastNewFeedSeconds >= 0.0)
+            {
+                gLastFeedIntervalSeconds =
+                    nowSeconds -
+                    gLastNewFeedSeconds;
+            }
+
+            gLastNewFeedSeconds = nowSeconds;
+            gLastProcessedFeedGeneration =
+                parsedFeed.generatedAt;
+        }
+
         SynchroniseAircraft(parsedFeed);
     }
 
@@ -1831,6 +1868,52 @@ namespace
         ReloadTrafficFeed();
         AeroPathTaxiGuidance::Update();
         UpdateMenuCheckmarks();
+
+        const double nowSeconds =
+            XPLMGetElapsedTime();
+
+        if (nowSeconds -
+                gLastTimingLogSeconds >=
+            TIMING_LOG_INTERVAL_SECONDS)
+        {
+            const double elapsedSeconds =
+                gLastTimingLogSeconds > 0.0
+                    ? nowSeconds -
+                      gLastTimingLogSeconds
+                    : TIMING_LOG_INTERVAL_SECONDS;
+
+            const std::uint64_t positionUpdates =
+                gXpmpPositionUpdateCount -
+                gLastXpmpPositionUpdateCount;
+
+            const double totalUpdatesPerSecond =
+                elapsedSeconds > 0.0
+                    ? static_cast<double>(
+                          positionUpdates) /
+                      elapsedSeconds
+                    : 0.0;
+
+            const double updatesPerAircraftPerSecond =
+                !gRemoteAircraft.empty()
+                    ? totalUpdatesPerSecond /
+                      static_cast<double>(
+                          gRemoteAircraft.size())
+                    : 0.0;
+
+            LogMessage(
+                "AeroPath Traffic timing: feed interval %.0f ms; poll interval %.0f ms; XPMP2 position updates %.1f/s per aircraft; active aircraft %zu",
+                gLastFeedIntervalSeconds * 1000.0,
+                static_cast<double>(
+                    TRAFFIC_POLL_INTERVAL_SECONDS) *
+                    1000.0,
+                updatesPerAircraftPerSecond,
+                gRemoteAircraft.size());
+
+            gLastTimingLogSeconds = nowSeconds;
+            gLastXpmpPositionUpdateCount =
+                gXpmpPositionUpdateCount;
+        }
+
         return TRAFFIC_POLL_INTERVAL_SECONDS;
     }
 
@@ -2148,6 +2231,12 @@ PLUGIN_API int XPluginEnable()
     gFeedEnabled = true;
     gFeedUnavailableSinceSeconds = -1.0;
     gLastReportedTrafficCount = static_cast<std::size_t>(-1);
+    gLastProcessedFeedGeneration.clear();
+    gLastNewFeedSeconds = -1.0;
+    gLastFeedIntervalSeconds = 0.0;
+    gLastTimingLogSeconds = XPLMGetElapsedTime();
+    gXpmpPositionUpdateCount = 0;
+    gLastXpmpPositionUpdateCount = 0;
 
     ReloadTrafficFeed();
 
