@@ -59,12 +59,16 @@ namespace
     constexpr double INTERPOLATION_BUFFER_FACTOR = 1.35;
     constexpr double TIMING_LOG_INTERVAL_SECONDS = 10.0;
     constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
+    constexpr float DEFAULT_TRAFFIC_LABEL_DISTANCE_NM = 100.0f;
 
 
     XPLMMenuID gMenu = nullptr;
 
     bool gMasterEnabled = true;
     bool gAircraftVisible = true;
+    bool gTrafficLabelsEnabled = true;
+    float gTrafficLabelDistanceNm =
+        DEFAULT_TRAFFIC_LABEL_DISTANCE_NM;
     bool gFeedEnabled = true;
     bool gFeedFilePreviouslyMissing = false;
     bool gFeedFilePreviouslyStale = false;
@@ -150,6 +154,10 @@ namespace
     {
         MENU_TRAFFIC_ENABLED = 0,
         MENU_AIRCRAFT_VISIBLE,
+        MENU_TRAFFIC_LABELS_OFF,
+        MENU_TRAFFIC_LABELS_20_NM,
+        MENU_TRAFFIC_LABELS_50_NM,
+        MENU_TRAFFIC_LABELS_100_NM,
         MENU_RELOAD_FEED,
         MENU_TAXI_ROUTE_LIGHTS,
         MENU_TAXI_REBUILD_ROUTE,
@@ -447,6 +455,34 @@ namespace
 #endif
 
         return defaultValue;
+    }
+
+    void ApplyTrafficLabelSettings()
+    {
+        XPMPEnableAircraftLabels(
+            gTrafficLabelsEnabled);
+
+        if (gTrafficLabelsEnabled)
+        {
+            /*
+             * Keep labels visible at the selected AeroPath range even when
+             * X-Plane reports reduced weather visibility. Labels are still
+             * drawn only for aircraft inside the current camera view.
+             */
+            XPMPSetAircraftLabelDist(
+                gTrafficLabelDistanceNm,
+                false);
+
+            LogMessage(
+                "AeroPath Traffic: Aircraft labels enabled to %.0f NM",
+                static_cast<double>(
+                    gTrafficLabelDistanceNm));
+        }
+        else
+        {
+            LogMessage(
+                "AeroPath Traffic: Aircraft labels disabled");
+        }
     }
 }
 
@@ -1186,6 +1222,43 @@ namespace
             gMenu,
             MENU_AIRCRAFT_VISIBLE,
             gAircraftVisible
+                ? xplm_Menu_Checked
+                : xplm_Menu_Unchecked);
+
+        XPLMCheckMenuItem(
+            gMenu,
+            MENU_TRAFFIC_LABELS_OFF,
+            !gTrafficLabelsEnabled
+                ? xplm_Menu_Checked
+                : xplm_Menu_Unchecked);
+
+        XPLMCheckMenuItem(
+            gMenu,
+            MENU_TRAFFIC_LABELS_20_NM,
+            gTrafficLabelsEnabled &&
+            std::abs(
+                gTrafficLabelDistanceNm -
+                20.0f) < 0.1f
+                ? xplm_Menu_Checked
+                : xplm_Menu_Unchecked);
+
+        XPLMCheckMenuItem(
+            gMenu,
+            MENU_TRAFFIC_LABELS_50_NM,
+            gTrafficLabelsEnabled &&
+            std::abs(
+                gTrafficLabelDistanceNm -
+                50.0f) < 0.1f
+                ? xplm_Menu_Checked
+                : xplm_Menu_Unchecked);
+
+        XPLMCheckMenuItem(
+            gMenu,
+            MENU_TRAFFIC_LABELS_100_NM,
+            gTrafficLabelsEnabled &&
+            std::abs(
+                gTrafficLabelDistanceNm -
+                100.0f) < 0.1f
                 ? xplm_Menu_Checked
                 : xplm_Menu_Unchecked);
 
@@ -1959,6 +2032,29 @@ namespace
                 SetAircraftVisibility();
                 break;
 
+            case MENU_TRAFFIC_LABELS_OFF:
+                gTrafficLabelsEnabled = false;
+                ApplyTrafficLabelSettings();
+                break;
+
+            case MENU_TRAFFIC_LABELS_20_NM:
+                gTrafficLabelsEnabled = true;
+                gTrafficLabelDistanceNm = 20.0f;
+                ApplyTrafficLabelSettings();
+                break;
+
+            case MENU_TRAFFIC_LABELS_50_NM:
+                gTrafficLabelsEnabled = true;
+                gTrafficLabelDistanceNm = 50.0f;
+                ApplyTrafficLabelSettings();
+                break;
+
+            case MENU_TRAFFIC_LABELS_100_NM:
+                gTrafficLabelsEnabled = true;
+                gTrafficLabelDistanceNm = 100.0f;
+                ApplyTrafficLabelSettings();
+                break;
+
             case MENU_RELOAD_FEED:
                 ReloadTrafficFeed();
                 break;
@@ -2060,6 +2156,34 @@ PLUGIN_API int XPluginStart(
         "Aircraft Visible",
         reinterpret_cast<void*>(
             MENU_AIRCRAFT_VISIBLE),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Traffic Labels Off",
+        reinterpret_cast<void*>(
+            MENU_TRAFFIC_LABELS_OFF),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Traffic Labels 20 NM",
+        reinterpret_cast<void*>(
+            MENU_TRAFFIC_LABELS_20_NM),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Traffic Labels 50 NM",
+        reinterpret_cast<void*>(
+            MENU_TRAFFIC_LABELS_50_NM),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Traffic Labels 100 NM",
+        reinterpret_cast<void*>(
+            MENU_TRAFFIC_LABELS_100_NM),
         0);
 
     XPLMAppendMenuItem(
@@ -2223,6 +2347,8 @@ PLUGIN_API int XPluginEnable()
             "AeroPath Traffic: AI/TCAS control unavailable: %s",
             result);
     }
+
+    ApplyTrafficLabelSettings();
 
     XPMPRegisterPlaneNotifierFunc(
         PlaneNotifier,
