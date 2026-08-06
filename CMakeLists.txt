@@ -178,7 +178,7 @@ target_link_libraries(AeroPathTraffic XPMP2)
 
 if (WIN32)
     # Link with winsock for network and iphlpapi for GetAdaptersAddresses
-    target_link_libraries(AeroPathTraffic ${XPLM_LIBRARY} ${FMOD_LIBRARY} wsock32 ws2_32 iphlpapi)
+    target_link_libraries(AeroPathTraffic ${XPLM_LIBRARY} ${FMOD_LIBRARY} wsock32 ws2_32 iphlpapi ole32 shell32 uuid user32)
     if (MINGW)
         # When cross-compiling we link the standard libraries statically
         target_link_options(AeroPathTraffic PRIVATE -static-libgcc -static-libstdc++)

@@ -26,7 +26,16 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <filesystem>
+#include <sstream>
+#include <system_error>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <shobjidl.h>
+    #include <shellapi.h>
+#endif
 
 // X-Plane SDK
 #include "XPLMDataAccess.h"
@@ -81,6 +90,11 @@ namespace
     XPLMDataRef gHeading = nullptr;
 
     std::string gTrafficFilePath;
+    std::string gResourcePath;
+    std::string gCslConfigPath;
+    std::string gBundledCslPath;
+    std::string gConfiguredExternalCslPath;
+    std::string gLoadedCslPath;
     std::size_t gLastReportedTrafficCount = static_cast<std::size_t>(-1);
     std::string gLastProcessedFeedGeneration;
     double gLastNewFeedSeconds = -1.0;
@@ -158,6 +172,10 @@ namespace
         MENU_TRAFFIC_LABELS_20_NM,
         MENU_TRAFFIC_LABELS_50_NM,
         MENU_TRAFFIC_LABELS_100_NM,
+        MENU_CSL_LOCATE_FOLDER,
+        MENU_CSL_USE_BUNDLED,
+        MENU_CSL_VALIDATE_FOLDER,
+        MENU_CSL_OPEN_FOLDER,
         MENU_RELOAD_FEED,
         MENU_TAXI_ROUTE_LIGHTS,
         MENU_TAXI_REBUILD_ROUTE,
@@ -304,6 +322,674 @@ namespace
             headingDegrees += 360.0f;
 
         return headingDegrees;
+    }
+
+    struct CslValidationResult
+    {
+        bool valid = false;
+        std::size_t packageCount = 0;
+        std::string message;
+    };
+
+    std::string JoinPath(
+        const std::string& first,
+        const std::string& second)
+    {
+        if (first.empty())
+            return second;
+
+        return (
+            std::filesystem::u8path(first) /
+            std::filesystem::u8path(second))
+            .lexically_normal()
+            .u8string();
+    }
+
+    CslValidationResult ValidateCslFolder(
+        const std::string& folderPath)
+    {
+        CslValidationResult result;
+        const std::string cleanPath = Trim(folderPath);
+
+        if (cleanPath.empty())
+        {
+            result.message = "No CSL folder has been selected.";
+            return result;
+        }
+
+        const std::filesystem::path root =
+            std::filesystem::u8path(cleanPath);
+
+        std::error_code error;
+
+        if (!std::filesystem::exists(root, error) ||
+            error ||
+            !std::filesystem::is_directory(root, error) ||
+            error)
+        {
+            result.message =
+                "The selected folder does not exist or cannot be read.";
+            return result;
+        }
+
+        std::filesystem::recursive_directory_iterator iterator(
+            root,
+            std::filesystem::directory_options::skip_permission_denied,
+            error);
+
+        const std::filesystem::recursive_directory_iterator end;
+
+        while (!error && iterator != end)
+        {
+            const std::filesystem::directory_entry& entry = *iterator;
+            std::error_code entryError;
+
+            if (entry.is_regular_file(entryError) &&
+                !entryError &&
+                ToLower(entry.path().filename().u8string()) ==
+                    "xsb_aircraft.txt")
+            {
+                ++result.packageCount;
+            }
+
+            iterator.increment(error);
+
+            if (error == std::errc::permission_denied)
+                error.clear();
+        }
+
+        if (result.packageCount == 0)
+        {
+            result.message =
+                "No xsb_aircraft.txt CSL package definitions were found in this folder or its subfolders.";
+            return result;
+        }
+
+        result.valid = true;
+        result.message =
+            std::to_string(result.packageCount) +
+            (result.packageCount == 1
+                ? " CSL package was found."
+                : " CSL packages were found.");
+
+        return result;
+    }
+
+    void LoadCslConfiguration()
+    {
+        gConfiguredExternalCslPath.clear();
+
+        if (gCslConfigPath.empty())
+            return;
+
+        std::ifstream input(gCslConfigPath);
+
+        if (!input.is_open())
+            return;
+
+        bool insideCslSection = false;
+        std::string line;
+
+        while (std::getline(input, line))
+        {
+            line = Trim(line);
+
+            if (line.empty() ||
+                line[0] == '#' ||
+                line[0] == ';')
+            {
+                continue;
+            }
+
+            if (line.front() == '[' &&
+                line.back() == ']')
+            {
+                insideCslSection =
+                    ToLower(
+                        Trim(
+                            line.substr(
+                                1,
+                                line.size() - 2))) ==
+                    "csl";
+
+                continue;
+            }
+
+            if (!insideCslSection)
+                continue;
+
+            const std::size_t equalsPosition =
+                line.find('=');
+
+            if (equalsPosition == std::string::npos)
+                continue;
+
+            const std::string key =
+                ToLower(
+                    Trim(
+                        line.substr(
+                            0,
+                            equalsPosition)));
+
+            if (key != "path")
+                continue;
+
+            gConfiguredExternalCslPath =
+                Trim(
+                    line.substr(
+                        equalsPosition + 1));
+
+            break;
+        }
+    }
+
+    bool SaveCslConfiguration(
+        const std::string& externalPath)
+    {
+        if (gCslConfigPath.empty())
+            return false;
+
+        std::ofstream output(
+            gCslConfigPath,
+            std::ios::out | std::ios::trunc);
+
+        if (!output.is_open())
+            return false;
+
+        output << "[CSL]\n";
+        output << "Path=" << Trim(externalPath) << "\n";
+        output << "UseBundledFallback=true\n";
+        output.flush();
+
+        return output.good();
+    }
+
+#ifdef _WIN32
+    std::wstring Utf8ToWide(const std::string& value)
+    {
+        if (value.empty())
+            return {};
+
+        const int requiredCharacters =
+            MultiByteToWideChar(
+                CP_UTF8,
+                MB_ERR_INVALID_CHARS,
+                value.c_str(),
+                -1,
+                nullptr,
+                0);
+
+        if (requiredCharacters <= 0)
+            return std::wstring(value.begin(), value.end());
+
+        std::wstring result(
+            static_cast<std::size_t>(requiredCharacters),
+            L'\0');
+
+        MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            value.c_str(),
+            -1,
+            result.data(),
+            requiredCharacters);
+
+        if (!result.empty() && result.back() == L'\0')
+            result.pop_back();
+
+        return result;
+    }
+
+    std::string WideToUtf8(const std::wstring& value)
+    {
+        if (value.empty())
+            return {};
+
+        const int requiredBytes =
+            WideCharToMultiByte(
+                CP_UTF8,
+                0,
+                value.c_str(),
+                -1,
+                nullptr,
+                0,
+                nullptr,
+                nullptr);
+
+        if (requiredBytes <= 0)
+            return std::string(value.begin(), value.end());
+
+        std::string result(
+            static_cast<std::size_t>(requiredBytes),
+            '\0');
+
+        WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            value.c_str(),
+            -1,
+            result.data(),
+            requiredBytes,
+            nullptr,
+            nullptr);
+
+        if (!result.empty() && result.back() == '\0')
+            result.pop_back();
+
+        return result;
+    }
+
+    void ShowCslMessage(
+        const std::string& title,
+        const std::string& message,
+        const bool isError = false)
+    {
+        MessageBoxW(
+            nullptr,
+            Utf8ToWide(message).c_str(),
+            Utf8ToWide(title).c_str(),
+            MB_OK |
+                (isError
+                    ? MB_ICONERROR
+                    : MB_ICONINFORMATION) |
+                MB_SETFOREGROUND);
+    }
+
+    std::string SelectCslFolder(
+        const std::string& initialFolder)
+    {
+        const HRESULT initialiseResult =
+            CoInitializeEx(
+                nullptr,
+                COINIT_APARTMENTTHREADED |
+                    COINIT_DISABLE_OLE1DDE);
+
+        const bool uninitialiseCom =
+            SUCCEEDED(initialiseResult);
+
+        if (FAILED(initialiseResult) &&
+            initialiseResult != RPC_E_CHANGED_MODE)
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "Windows could not initialise the CSL folder browser.",
+                true);
+
+            return {};
+        }
+
+        IFileOpenDialog* dialog = nullptr;
+
+        HRESULT result =
+            CoCreateInstance(
+                CLSID_FileOpenDialog,
+                nullptr,
+                CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&dialog));
+
+        if (FAILED(result) || !dialog)
+        {
+            if (uninitialiseCom)
+                CoUninitialize();
+
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "Windows could not open the CSL folder browser.",
+                true);
+
+            return {};
+        }
+
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(
+            options |
+            FOS_PICKFOLDERS |
+            FOS_FORCEFILESYSTEM |
+            FOS_PATHMUSTEXIST);
+        dialog->SetTitle(
+            L"Locate your CSL model library");
+
+        if (!Trim(initialFolder).empty())
+        {
+            IShellItem* initialItem = nullptr;
+            const std::wstring initialFolderWide =
+                Utf8ToWide(initialFolder);
+
+            if (SUCCEEDED(
+                    SHCreateItemFromParsingName(
+                        initialFolderWide.c_str(),
+                        nullptr,
+                        IID_PPV_ARGS(&initialItem))) &&
+                initialItem)
+            {
+                dialog->SetFolder(initialItem);
+                initialItem->Release();
+            }
+        }
+
+        std::string selectedFolder;
+        result = dialog->Show(nullptr);
+
+        if (SUCCEEDED(result))
+        {
+            IShellItem* selectedItem = nullptr;
+
+            if (SUCCEEDED(dialog->GetResult(&selectedItem)) &&
+                selectedItem)
+            {
+                PWSTR selectedPath = nullptr;
+
+                if (SUCCEEDED(
+                        selectedItem->GetDisplayName(
+                            SIGDN_FILESYSPATH,
+                            &selectedPath)) &&
+                    selectedPath)
+                {
+                    selectedFolder =
+                        WideToUtf8(selectedPath);
+
+                    CoTaskMemFree(selectedPath);
+                }
+
+                selectedItem->Release();
+            }
+        }
+
+        dialog->Release();
+
+        if (uninitialiseCom)
+            CoUninitialize();
+
+        return selectedFolder;
+    }
+
+    bool OpenFolderInExplorer(
+        const std::string& folderPath)
+    {
+        if (Trim(folderPath).empty())
+            return false;
+
+        const HINSTANCE result =
+            ShellExecuteW(
+                nullptr,
+                L"open",
+                Utf8ToWide(folderPath).c_str(),
+                nullptr,
+                nullptr,
+                SW_SHOWNORMAL);
+
+        return reinterpret_cast<std::intptr_t>(result) > 32;
+    }
+#else
+    void ShowCslMessage(
+        const std::string& title,
+        const std::string& message,
+        const bool = false)
+    {
+        LogMessage(
+            "%s: %s",
+            title.c_str(),
+            message.c_str());
+    }
+
+    std::string SelectCslFolder(const std::string&)
+    {
+        ShowCslMessage(
+            "AeroPath Traffic",
+            "The in-plugin CSL folder browser is currently available on Windows only.",
+            true);
+
+        return {};
+    }
+
+    bool OpenFolderInExplorer(const std::string&)
+    {
+        return false;
+    }
+#endif
+
+    std::string ConfiguredCslFolder()
+    {
+        return gConfiguredExternalCslPath.empty()
+            ? gBundledCslPath
+            : gConfiguredExternalCslPath;
+    }
+
+    void LocateCslFolder()
+    {
+        if (gResourcePath.empty())
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "AeroPath Traffic must be enabled before a CSL folder can be selected.",
+                true);
+
+            return;
+        }
+
+        std::string initialFolder =
+            ConfiguredCslFolder();
+
+        if (!ValidateCslFolder(initialFolder).valid)
+            initialFolder = gResourcePath;
+
+        const std::string selectedFolder =
+            SelectCslFolder(initialFolder);
+
+        if (selectedFolder.empty())
+            return;
+
+        const CslValidationResult validation =
+            ValidateCslFolder(selectedFolder);
+
+        if (!validation.valid)
+        {
+            ShowCslMessage(
+                "Invalid CSL folder",
+                validation.message,
+                true);
+
+            LogMessage(
+                "AeroPath Traffic: Rejected CSL folder '%s': %s",
+                selectedFolder.c_str(),
+                validation.message.c_str());
+
+            return;
+        }
+
+        if (!SaveCslConfiguration(selectedFolder))
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "The selected CSL folder is valid, but AeroPath could not save AeroPathTraffic.ini.",
+                true);
+
+            return;
+        }
+
+        gConfiguredExternalCslPath = selectedFolder;
+
+        std::ostringstream message;
+        message << "Selected CSL library:\n\n"
+                << selectedFolder << "\n\n"
+                << validation.packageCount
+                << (validation.packageCount == 1
+                    ? " package was found."
+                    : " packages were found.")
+                << "\n\nRestart X-Plane, or disable and re-enable AeroPath Traffic, to load this library.";
+
+        ShowCslMessage(
+            "AeroPath Traffic CSL library",
+            message.str());
+
+        LogMessage(
+            "AeroPath Traffic: External CSL folder selected '%s' (%zu packages); reload required",
+            selectedFolder.c_str(),
+            validation.packageCount);
+    }
+
+    void UseBundledCslFolder()
+    {
+        if (gResourcePath.empty())
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "AeroPath Traffic must be enabled before the CSL setting can be changed.",
+                true);
+
+            return;
+        }
+
+        if (!SaveCslConfiguration(""))
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "AeroPath could not save the bundled CSL selection to AeroPathTraffic.ini.",
+                true);
+
+            return;
+        }
+
+        gConfiguredExternalCslPath.clear();
+
+        const CslValidationResult validation =
+            ValidateCslFolder(gBundledCslPath);
+
+        std::ostringstream message;
+        message << "AeroPath's bundled CSL library has been selected.";
+
+        if (validation.valid)
+        {
+            message << "\n\n"
+                    << validation.packageCount
+                    << (validation.packageCount == 1
+                        ? " package was found."
+                        : " packages were found.");
+        }
+
+        message << "\n\nRestart X-Plane, or disable and re-enable AeroPath Traffic, to apply the change.";
+
+        ShowCslMessage(
+            "AeroPath Traffic CSL library",
+            message.str());
+
+        LogMessage(
+            "AeroPath Traffic: Bundled CSL library selected; reload required");
+    }
+
+    void ValidateConfiguredCslFolder()
+    {
+        const std::string selectedFolder =
+            ConfiguredCslFolder();
+
+        const CslValidationResult validation =
+            ValidateCslFolder(selectedFolder);
+
+        std::ostringstream message;
+        message << "Selected folder:\n\n"
+                << (selectedFolder.empty()
+                    ? "No folder selected"
+                    : selectedFolder)
+                << "\n\n"
+                << validation.message;
+
+        ShowCslMessage(
+            validation.valid
+                ? "CSL folder is valid"
+                : "CSL folder is invalid",
+            message.str(),
+            !validation.valid);
+
+        LogMessage(
+            "AeroPath Traffic: CSL validation for '%s': %s",
+            selectedFolder.c_str(),
+            validation.message.c_str());
+    }
+
+    void OpenConfiguredCslFolder()
+    {
+        const std::string selectedFolder =
+            ConfiguredCslFolder();
+
+        const CslValidationResult validation =
+            ValidateCslFolder(selectedFolder);
+
+        if (!validation.valid)
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                validation.message,
+                true);
+
+            return;
+        }
+
+        if (!OpenFolderInExplorer(selectedFolder))
+        {
+            ShowCslMessage(
+                "AeroPath Traffic",
+                "The selected CSL folder could not be opened.",
+                true);
+        }
+    }
+
+    std::string ResolveCslFolderForStartup()
+    {
+        LoadCslConfiguration();
+
+        if (!gConfiguredExternalCslPath.empty())
+        {
+            const CslValidationResult externalValidation =
+                ValidateCslFolder(
+                    gConfiguredExternalCslPath);
+
+            if (externalValidation.valid)
+            {
+                LogMessage(
+                    "AeroPath Traffic: Loading external CSL library '%s' (%zu packages)",
+                    gConfiguredExternalCslPath.c_str(),
+                    externalValidation.packageCount);
+
+                return gConfiguredExternalCslPath;
+            }
+
+            LogMessage(
+                "AeroPath Traffic: External CSL library '%s' is unavailable: %s; using bundled fallback",
+                gConfiguredExternalCslPath.c_str(),
+                externalValidation.message.c_str());
+        }
+
+        const CslValidationResult bundledValidation =
+            ValidateCslFolder(gBundledCslPath);
+
+        if (bundledValidation.valid)
+        {
+            LogMessage(
+                "AeroPath Traffic: Loading bundled CSL library '%s' (%zu packages)",
+                gBundledCslPath.c_str(),
+                bundledValidation.packageCount);
+
+            return gBundledCslPath;
+        }
+
+        const CslValidationResult legacyValidation =
+            ValidateCslFolder(gResourcePath);
+
+        if (legacyValidation.valid)
+        {
+            LogMessage(
+                "AeroPath Traffic: Bundled CSL subfolder was not found; loading legacy Resources root '%s' (%zu packages)",
+                gResourcePath.c_str(),
+                legacyValidation.packageCount);
+
+            return gResourcePath;
+        }
+
+        LogMessage(
+            "AeroPath Traffic: No valid CSL packages were found. XPMP2 will still initialise, but remote aircraft models may be unavailable");
+
+        return gResourcePath;
     }
 
     char* SafeCopy(
@@ -1264,6 +1950,13 @@ namespace
 
         XPLMCheckMenuItem(
             gMenu,
+            MENU_CSL_USE_BUNDLED,
+            gConfiguredExternalCslPath.empty()
+                ? xplm_Menu_Checked
+                : xplm_Menu_Unchecked);
+
+        XPLMCheckMenuItem(
+            gMenu,
             MENU_TAXI_ROUTE_LIGHTS,
             AeroPathTaxiGuidance::IsManualVisible()
                 ? xplm_Menu_Checked
@@ -2055,6 +2748,22 @@ namespace
                 ApplyTrafficLabelSettings();
                 break;
 
+            case MENU_CSL_LOCATE_FOLDER:
+                LocateCslFolder();
+                break;
+
+            case MENU_CSL_USE_BUNDLED:
+                UseBundledCslFolder();
+                break;
+
+            case MENU_CSL_VALIDATE_FOLDER:
+                ValidateConfiguredCslFolder();
+                break;
+
+            case MENU_CSL_OPEN_FOLDER:
+                OpenConfiguredCslFolder();
+                break;
+
             case MENU_RELOAD_FEED:
                 ReloadTrafficFeed();
                 break;
@@ -2188,6 +2897,34 @@ PLUGIN_API int XPluginStart(
 
     XPLMAppendMenuItem(
         gMenu,
+        "Locate CSL Folder...",
+        reinterpret_cast<void*>(
+            MENU_CSL_LOCATE_FOLDER),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Use AeroPath Bundled CSL",
+        reinterpret_cast<void*>(
+            MENU_CSL_USE_BUNDLED),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Validate Selected CSL Folder",
+        reinterpret_cast<void*>(
+            MENU_CSL_VALIDATE_FOLDER),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
+        "Open Selected CSL Folder",
+        reinterpret_cast<void*>(
+            MENU_CSL_OPEN_FOLDER),
+        0);
+
+    XPLMAppendMenuItem(
+        gMenu,
         "Reload Traffic File",
         reinterpret_cast<void*>(
             MENU_RELOAD_FEED),
@@ -2304,6 +3041,16 @@ PLUGIN_API int XPluginEnable()
     std::string resourcePath = pluginPath;
     resourcePath += "Resources";
 
+    gResourcePath = resourcePath;
+    gCslConfigPath =
+        JoinPath(
+            gResourcePath,
+            "AeroPathTraffic.ini");
+    gBundledCslPath =
+        JoinPath(
+            gResourcePath,
+            "CSL");
+
     gTrafficFilePath = resourcePath;
     gTrafficFilePath += pathSeparator;
     gTrafficFilePath += "AeroPathTraffic.txt";
@@ -2326,15 +3073,25 @@ PLUGIN_API int XPluginEnable()
         return 0;
     }
 
+    gLoadedCslPath =
+        ResolveCslFolderForStartup();
+
     result =
         XPMPLoadCSLPackage(
-            resourcePath.c_str());
+            gLoadedCslPath.c_str());
 
     if (result[0])
     {
         LogMessage(
-            "AeroPath Traffic: CSL loading reported: %s",
+            "AeroPath Traffic: CSL loading reported for '%s': %s",
+            gLoadedCslPath.c_str(),
             result);
+    }
+    else
+    {
+        LogMessage(
+            "AeroPath Traffic: CSL library loaded from '%s'",
+            gLoadedCslPath.c_str());
     }
 
     result =
