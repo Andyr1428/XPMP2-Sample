@@ -3,7 +3,8 @@
 /// @details    Renders multiple AeroPath-controlled aircraft through XPMP2 and
 ///             reads their states from Resources/AeroPathTraffic.txt.
 ///
-///             Feed version 4 uses repeated [aircraft] blocks and explicit aircraft/operator/livery identity. The original
+///             Feed version 5 uses repeated [aircraft] blocks, explicit aircraft/operator/livery identity,
+///             motion data and the server's last-seen timestamp. The original
 ///             single-aircraft key/value feed remains supported so existing
 ///             development installations continue to work while the AeroPath
 ///             desktop writer is upgraded.
@@ -62,10 +63,16 @@ namespace
     constexpr float TRAFFIC_POLL_INTERVAL_SECONDS = 0.10f;
     constexpr double TRAFFIC_FEED_TIMEOUT_SECONDS = 15.0;
     constexpr double TRAFFIC_FILE_GRACE_SECONDS = 2.0;
-    constexpr double MIN_INTERPOLATION_SECONDS = 0.12;
-    constexpr double DEFAULT_INTERPOLATION_SECONDS = 0.30;
-    constexpr double MAX_INTERPOLATION_SECONDS = 1.50;
-    constexpr double INTERPOLATION_BUFFER_FACTOR = 1.35;
+    constexpr double MIN_INTERPOLATION_SECONDS = 0.10;
+    constexpr double DEFAULT_INTERPOLATION_SECONDS = 0.24;
+    constexpr double MAX_INTERPOLATION_SECONDS = 0.80;
+    constexpr double INTERPOLATION_BUFFER_FACTOR = 0.90;
+    constexpr double MAX_EXTRAPOLATION_SECONDS = 1.75;
+    constexpr double EARTH_RADIUS_METRES = 6371000.0;
+    constexpr double KNOTS_TO_METRES_PER_SECOND = 0.5144444444444445;
+    constexpr double MAX_GROUND_TRACK_SPEED_METRES_PER_SECOND = 90.0;
+    constexpr double MAX_AIRBORNE_TRACK_SPEED_METRES_PER_SECOND = 430.0;
+    constexpr double VELOCITY_BLEND_FACTOR = 0.45;
     constexpr double TIMING_LOG_INTERVAL_SECONDS = 10.0;
     constexpr std::size_t MAX_REMOTE_AIRCRAFT = 100;
     constexpr float DEFAULT_TRAFFIC_LABEL_DISTANCE_NM = 100.0f;
@@ -142,6 +149,9 @@ namespace
         double longitude = 0.0;
         double altitudeFeet = 0.0;
         float headingDegrees = 0.0f;
+        double groundSpeedKnots = 0.0;
+        double verticalSpeedFpm = 0.0;
+        std::string lastSeenAt;
 
         // Shared attitude and aircraft configuration.
         float pitchDegrees = 0.0f;
@@ -1193,6 +1203,8 @@ public:
         const double nowSeconds = XPLMGetElapsedTime();
         interpolationStartSeconds_ = nowSeconds;
         lastSnapshotSeconds_ = nowSeconds;
+        lastAcceptedSnapshot_ = initialState;
+        hasAcceptedSnapshot_ = true;
 
         EnforceDeterministicModelPolicy();
         ApplyIdentity(state_);
@@ -1205,27 +1217,50 @@ public:
 
     void ApplyState(const TrafficState& nextState)
     {
+        TrafficState acceptedState = nextState;
+
+        const bool olderServerSnapshot =
+            hasAcceptedSnapshot_ &&
+            !Trim(nextState.lastSeenAt).empty() &&
+            !Trim(lastAcceptedSnapshot_.lastSeenAt).empty() &&
+            Trim(nextState.lastSeenAt) <
+                Trim(lastAcceptedSnapshot_.lastSeenAt);
+
+        if (olderServerSnapshot)
+        {
+            /*
+             * Never move an aircraft back to a server snapshot older than the
+             * last one already accepted. Identity, labels and lights can still
+             * update, but the motion fields stay on the newest state.
+             */
+            CopyMotionState(
+                state_,
+                acceptedState);
+        }
+
         const bool modelChanged =
-            state_.icaoType != nextState.icaoType ||
-            state_.airline != nextState.airline ||
-            state_.livery != nextState.livery;
+            state_.icaoType != acceptedState.icaoType ||
+            state_.airline != acceptedState.airline ||
+            state_.livery != acceptedState.livery;
 
         const bool identityChanged =
             modelChanged ||
-            state_.airlineName != nextState.airlineName ||
-            state_.registration != nextState.registration ||
-            state_.flightNumber != nextState.flightNumber ||
-            state_.callsign != nextState.callsign ||
-            state_.uniqueId != nextState.uniqueId ||
-            state_.labelConfigured != nextState.labelConfigured ||
-            state_.labelText != nextState.labelText ||
-            state_.labelRed != nextState.labelRed ||
-            state_.labelGreen != nextState.labelGreen ||
-            state_.labelBlue != nextState.labelBlue;
+            state_.airlineName != acceptedState.airlineName ||
+            state_.registration != acceptedState.registration ||
+            state_.flightNumber != acceptedState.flightNumber ||
+            state_.callsign != acceptedState.callsign ||
+            state_.uniqueId != acceptedState.uniqueId ||
+            state_.labelConfigured != acceptedState.labelConfigured ||
+            state_.labelText != acceptedState.labelText ||
+            state_.labelRed != acceptedState.labelRed ||
+            state_.labelGreen != acceptedState.labelGreen ||
+            state_.labelBlue != acceptedState.labelBlue;
 
         const double nowSeconds = XPLMGetElapsedTime();
         const bool motionChanged =
-            HasMotionChanged(interpolationTo_, nextState);
+            HasMotionChanged(
+                interpolationTo_,
+                acceptedState);
 
         if (motionChanged)
         {
@@ -1236,30 +1271,127 @@ public:
                 nowSeconds - lastSnapshotSeconds_;
 
             if (!std::isfinite(observedIntervalSeconds) ||
-                observedIntervalSeconds < MIN_INTERPOLATION_SECONDS)
+                observedIntervalSeconds <
+                    MIN_INTERPOLATION_SECONDS)
             {
                 observedIntervalSeconds =
                     DEFAULT_INTERPOLATION_SECONDS;
             }
 
-            interpolationFrom_ = currentRenderedState;
-            interpolationTo_ = nextState;
-            interpolationStartSeconds_ = nowSeconds;
-            interpolationDurationSeconds_ = std::clamp(
-                observedIntervalSeconds *
-                    INTERPOLATION_BUFFER_FACTOR,
-                MIN_INTERPOLATION_SECONDS,
-                MAX_INTERPOLATION_SECONDS);
+            bool teleportDetected = false;
+            bool directionReversed = false;
+
+            if (!olderServerSnapshot &&
+                acceptedState.worldMode &&
+                currentRenderedState.worldMode &&
+                IsValidWorldPosition(acceptedState) &&
+                IsValidWorldPosition(currentRenderedState))
+            {
+                UpdateMotionEstimate(
+                    acceptedState,
+                    observedIntervalSeconds,
+                    directionReversed,
+                    teleportDetected);
+
+                if (!teleportDetected &&
+                    hasVelocityEstimate_ &&
+                    !directionReversed)
+                {
+                    double correctionNorthMetres = 0.0;
+                    double correctionEastMetres = 0.0;
+
+                    CalculateWorldDeltaMetres(
+                        currentRenderedState,
+                        acceptedState,
+                        correctionNorthMetres,
+                        correctionEastMetres);
+
+                    const double horizontalSpeed =
+                        std::hypot(
+                            velocityNorthMetresPerSecond_,
+                            velocityEastMetresPerSecond_);
+
+                    if (horizontalSpeed > 0.5)
+                    {
+                        const double alongTrackCorrectionMetres =
+                            (
+                                correctionNorthMetres *
+                                    velocityNorthMetresPerSecond_ +
+                                correctionEastMetres *
+                                    velocityEastMetresPerSecond_
+                            ) /
+                            horizontalSpeed;
+
+                        const double backwardToleranceMetres =
+                            std::max(
+                                acceptedState.onGround
+                                    ? 2.5
+                                    : 12.0,
+                                horizontalSpeed * 0.30);
+
+                        if (alongTrackCorrectionMetres <
+                            -backwardToleranceMetres)
+                        {
+                            /*
+                             * A delayed packet can arrive behind the position
+                             * already being rendered. Do not reverse the model;
+                             * retain the current position and continue using the
+                             * newest velocity estimate until the feed catches up.
+                             */
+                            acceptedState.latitude =
+                                currentRenderedState.latitude;
+                            acceptedState.longitude =
+                                currentRenderedState.longitude;
+                            acceptedState.altitudeFeet =
+                                currentRenderedState.altitudeFeet;
+                        }
+                    }
+                }
+            }
+
+            if (teleportDetected)
+            {
+                interpolationFrom_ = acceptedState;
+                interpolationTo_ = acceptedState;
+                interpolationStartSeconds_ = nowSeconds;
+                interpolationDurationSeconds_ = 0.0;
+            }
+            else
+            {
+                interpolationFrom_ = currentRenderedState;
+                interpolationTo_ = acceptedState;
+                interpolationStartSeconds_ = nowSeconds;
+                interpolationDurationSeconds_ = std::clamp(
+                    observedIntervalSeconds *
+                        INTERPOLATION_BUFFER_FACTOR,
+                    MIN_INTERPOLATION_SECONDS,
+                    MAX_INTERPOLATION_SECONDS);
+            }
 
             lastSnapshotSeconds_ = nowSeconds;
+
+            if (!olderServerSnapshot)
+            {
+                lastAcceptedSnapshot_ = nextState;
+                hasAcceptedSnapshot_ = true;
+            }
         }
         else
         {
             // Keep non-positional state, such as lights, current immediately.
-            interpolationTo_ = nextState;
+            interpolationTo_ = acceptedState;
+
+            if (!olderServerSnapshot &&
+                (!hasAcceptedSnapshot_ ||
+                 Trim(nextState.lastSeenAt) >=
+                    Trim(lastAcceptedSnapshot_.lastSeenAt)))
+            {
+                lastAcceptedSnapshot_ = nextState;
+                hasAcceptedSnapshot_ = true;
+            }
         }
 
-        state_ = nextState;
+        state_ = acceptedState;
 
         if (modelChanged)
         {
@@ -1726,12 +1858,41 @@ public:
     }
 
 private:
+    static void CopyMotionState(
+        const TrafficState& source,
+        TrafficState& destination)
+    {
+        destination.worldMode = source.worldMode;
+        destination.onGround = source.onGround;
+        destination.forwardMetres = source.forwardMetres;
+        destination.rightMetres = source.rightMetres;
+        destination.upMetres = source.upMetres;
+        destination.headingOffsetDegrees =
+            source.headingOffsetDegrees;
+        destination.latitude = source.latitude;
+        destination.longitude = source.longitude;
+        destination.altitudeFeet = source.altitudeFeet;
+        destination.headingDegrees = source.headingDegrees;
+        destination.groundSpeedKnots =
+            source.groundSpeedKnots;
+        destination.verticalSpeedFpm =
+            source.verticalSpeedFpm;
+        destination.lastSeenAt = source.lastSeenAt;
+        destination.pitchDegrees = source.pitchDegrees;
+        destination.rollDegrees = source.rollDegrees;
+        destination.gearRatio = source.gearRatio;
+        destination.flapRatio = source.flapRatio;
+        destination.thrustRatio = source.thrustRatio;
+    }
+
     static bool HasMotionChanged(
         const TrafficState& previousState,
         const TrafficState& nextState)
     {
         constexpr double POSITION_EPSILON = 0.0000001;
         constexpr double ALTITUDE_EPSILON_FEET = 0.05;
+        constexpr double SPEED_EPSILON_KNOTS = 0.05;
+        constexpr double VERTICAL_SPEED_EPSILON_FPM = 1.0;
         constexpr float ANGLE_EPSILON_DEGREES = 0.05f;
         constexpr float RATIO_EPSILON = 0.001f;
 
@@ -1743,6 +1904,14 @@ private:
                 POSITION_EPSILON ||
             std::abs(previousState.altitudeFeet - nextState.altitudeFeet) >
                 ALTITUDE_EPSILON_FEET ||
+            std::abs(
+                previousState.groundSpeedKnots -
+                nextState.groundSpeedKnots) >
+                SPEED_EPSILON_KNOTS ||
+            std::abs(
+                previousState.verticalSpeedFpm -
+                nextState.verticalSpeedFpm) >
+                VERTICAL_SPEED_EPSILON_FPM ||
             std::abs(previousState.headingDegrees - nextState.headingDegrees) >
                 ANGLE_EPSILON_DEGREES ||
             std::abs(previousState.pitchDegrees - nextState.pitchDegrees) >
@@ -1755,6 +1924,326 @@ private:
                 RATIO_EPSILON ||
             std::abs(previousState.thrustRatio - nextState.thrustRatio) >
                 RATIO_EPSILON;
+    }
+
+    static void CalculateWorldDeltaMetres(
+        const TrafficState& fromState,
+        const TrafficState& toState,
+        double& northMetres,
+        double& eastMetres)
+    {
+        const double fromLatitudeRadians =
+            DegreesToRadians(fromState.latitude);
+
+        const double toLatitudeRadians =
+            DegreesToRadians(toState.latitude);
+
+        const double latitudeDifferenceRadians =
+            toLatitudeRadians -
+            fromLatitudeRadians;
+
+        const double longitudeDifferenceRadians =
+            DegreesToRadians(
+                toState.longitude -
+                fromState.longitude);
+
+        const double averageLatitudeRadians =
+            (fromLatitudeRadians +
+             toLatitudeRadians) * 0.5;
+
+        northMetres =
+            latitudeDifferenceRadians *
+            EARTH_RADIUS_METRES;
+
+        eastMetres =
+            longitudeDifferenceRadians *
+            EARTH_RADIUS_METRES *
+            std::cos(averageLatitudeRadians);
+    }
+
+    static double TeleportThresholdMetres(
+        const TrafficState& state)
+    {
+        return state.onGround
+            ? 1500.0
+            : 10000.0;
+    }
+
+    void ResetMotionEstimate()
+    {
+        velocityNorthMetresPerSecond_ = 0.0;
+        velocityEastMetresPerSecond_ = 0.0;
+        velocityVerticalFeetPerSecond_ = 0.0;
+        hasVelocityEstimate_ = false;
+    }
+
+    void UpdateMotionEstimate(
+        const TrafficState& nextState,
+        const double observedIntervalSeconds,
+        bool& directionReversed,
+        bool& teleportDetected)
+    {
+        directionReversed = false;
+        teleportDetected = false;
+
+        if (!hasAcceptedSnapshot_ ||
+            !lastAcceptedSnapshot_.worldMode ||
+            !nextState.worldMode ||
+            !IsValidWorldPosition(lastAcceptedSnapshot_) ||
+            !IsValidWorldPosition(nextState))
+        {
+            ResetMotionEstimate();
+            return;
+        }
+
+        double northMetres = 0.0;
+        double eastMetres = 0.0;
+
+        CalculateWorldDeltaMetres(
+            lastAcceptedSnapshot_,
+            nextState,
+            northMetres,
+            eastMetres);
+
+        const double horizontalDistanceMetres =
+            std::hypot(
+                northMetres,
+                eastMetres);
+
+        if (horizontalDistanceMetres >
+            TeleportThresholdMetres(nextState))
+        {
+            teleportDetected = true;
+            ResetMotionEstimate();
+            return;
+        }
+
+        const double safeIntervalSeconds =
+            std::clamp(
+                observedIntervalSeconds,
+                MIN_INTERPOLATION_SECONDS,
+                5.0);
+
+        const double observedNorthMetresPerSecond =
+            northMetres /
+            safeIntervalSeconds;
+
+        const double observedEastMetresPerSecond =
+            eastMetres /
+            safeIntervalSeconds;
+
+        const double observedVerticalFeetPerSecond =
+            (
+                nextState.altitudeFeet -
+                lastAcceptedSnapshot_.altitudeFeet
+            ) /
+            safeIntervalSeconds;
+
+        const double observedHorizontalSpeed =
+            std::hypot(
+                observedNorthMetresPerSecond,
+                observedEastMetresPerSecond);
+
+        const double maximumReasonableSpeed =
+            nextState.onGround
+                ? MAX_GROUND_TRACK_SPEED_METRES_PER_SECOND
+                : MAX_AIRBORNE_TRACK_SPEED_METRES_PER_SECOND;
+
+        if (!std::isfinite(observedHorizontalSpeed) ||
+            observedHorizontalSpeed >
+                maximumReasonableSpeed)
+        {
+            return;
+        }
+
+        const double reportedSpeedMetresPerSecond =
+            std::clamp(
+                nextState.groundSpeedKnots *
+                    KNOTS_TO_METRES_PER_SECOND,
+                0.0,
+                maximumReasonableSpeed);
+
+        if (reportedSpeedMetresPerSecond < 0.5 &&
+            horizontalDistanceMetres < 2.0)
+        {
+            velocityNorthMetresPerSecond_ = 0.0;
+            velocityEastMetresPerSecond_ = 0.0;
+            velocityVerticalFeetPerSecond_ =
+                nextState.onGround
+                    ? 0.0
+                    : nextState.verticalSpeedFpm / 60.0;
+            hasVelocityEstimate_ = false;
+            return;
+        }
+
+        double candidateNorthMetresPerSecond =
+            observedNorthMetresPerSecond;
+
+        double candidateEastMetresPerSecond =
+            observedEastMetresPerSecond;
+
+        if (observedHorizontalSpeed > 0.25 &&
+            reportedSpeedMetresPerSecond > 0.25)
+        {
+            const double blendedSpeed =
+                observedHorizontalSpeed * 0.65 +
+                reportedSpeedMetresPerSecond * 0.35;
+
+            candidateNorthMetresPerSecond =
+                observedNorthMetresPerSecond /
+                observedHorizontalSpeed *
+                blendedSpeed;
+
+            candidateEastMetresPerSecond =
+                observedEastMetresPerSecond /
+                observedHorizontalSpeed *
+                blendedSpeed;
+        }
+        else if (observedHorizontalSpeed <= 0.25 &&
+                 reportedSpeedMetresPerSecond > 0.25 &&
+                 !nextState.onGround)
+        {
+            const double headingRadians =
+                DegreesToRadians(
+                    nextState.headingDegrees);
+
+            candidateNorthMetresPerSecond =
+                std::cos(headingRadians) *
+                reportedSpeedMetresPerSecond;
+
+            candidateEastMetresPerSecond =
+                std::sin(headingRadians) *
+                reportedSpeedMetresPerSecond;
+        }
+
+        const double candidateHorizontalSpeed =
+            std::hypot(
+                candidateNorthMetresPerSecond,
+                candidateEastMetresPerSecond);
+
+        if (hasVelocityEstimate_)
+        {
+            const double existingHorizontalSpeed =
+                std::hypot(
+                    velocityNorthMetresPerSecond_,
+                    velocityEastMetresPerSecond_);
+
+            const double directionDotProduct =
+                velocityNorthMetresPerSecond_ *
+                    candidateNorthMetresPerSecond +
+                velocityEastMetresPerSecond_ *
+                    candidateEastMetresPerSecond;
+
+            directionReversed =
+                existingHorizontalSpeed > 0.75 &&
+                candidateHorizontalSpeed > 0.75 &&
+                directionDotProduct <
+                    -0.20 *
+                    existingHorizontalSpeed *
+                    candidateHorizontalSpeed;
+
+            if (directionReversed)
+            {
+                velocityNorthMetresPerSecond_ =
+                    candidateNorthMetresPerSecond;
+                velocityEastMetresPerSecond_ =
+                    candidateEastMetresPerSecond;
+            }
+            else
+            {
+                velocityNorthMetresPerSecond_ =
+                    velocityNorthMetresPerSecond_ *
+                        (1.0 - VELOCITY_BLEND_FACTOR) +
+                    candidateNorthMetresPerSecond *
+                        VELOCITY_BLEND_FACTOR;
+
+                velocityEastMetresPerSecond_ =
+                    velocityEastMetresPerSecond_ *
+                        (1.0 - VELOCITY_BLEND_FACTOR) +
+                    candidateEastMetresPerSecond *
+                        VELOCITY_BLEND_FACTOR;
+            }
+
+            velocityVerticalFeetPerSecond_ =
+                velocityVerticalFeetPerSecond_ *
+                    (1.0 - VELOCITY_BLEND_FACTOR) +
+                observedVerticalFeetPerSecond *
+                    VELOCITY_BLEND_FACTOR;
+        }
+        else if (candidateHorizontalSpeed > 0.25)
+        {
+            velocityNorthMetresPerSecond_ =
+                candidateNorthMetresPerSecond;
+            velocityEastMetresPerSecond_ =
+                candidateEastMetresPerSecond;
+            velocityVerticalFeetPerSecond_ =
+                observedVerticalFeetPerSecond;
+            hasVelocityEstimate_ = true;
+        }
+
+        if (!nextState.onGround &&
+            std::abs(nextState.verticalSpeedFpm) > 10.0)
+        {
+            velocityVerticalFeetPerSecond_ =
+                velocityVerticalFeetPerSecond_ * 0.65 +
+                (nextState.verticalSpeedFpm / 60.0) * 0.35;
+        }
+        else if (nextState.onGround)
+        {
+            velocityVerticalFeetPerSecond_ = 0.0;
+        }
+    }
+
+    static void AdvanceWorldState(
+        TrafficState& state,
+        const double northMetresPerSecond,
+        const double eastMetresPerSecond,
+        const double verticalFeetPerSecond,
+        const double seconds)
+    {
+        if (seconds <= 0.0 ||
+            !state.worldMode ||
+            !IsValidWorldPosition(state))
+        {
+            return;
+        }
+
+        const double northMetres =
+            northMetresPerSecond *
+            seconds;
+
+        const double eastMetres =
+            eastMetresPerSecond *
+            seconds;
+
+        const double latitudeRadians =
+            DegreesToRadians(state.latitude);
+
+        state.latitude +=
+            northMetres /
+            EARTH_RADIUS_METRES *
+            180.0 /
+            PI;
+
+        const double longitudeScale =
+            EARTH_RADIUS_METRES *
+            std::max(
+                0.01,
+                std::abs(
+                    std::cos(latitudeRadians)));
+
+        state.longitude +=
+            eastMetres /
+            longitudeScale *
+            180.0 /
+            PI;
+
+        if (!state.onGround)
+        {
+            state.altitudeFeet +=
+                verticalFeetPerSecond *
+                seconds;
+        }
     }
 
     static double InterpolateDouble(
@@ -1801,26 +2290,41 @@ private:
         TrafficState renderedState = state_;
 
         if (interpolationDurationSeconds_ <= 0.0 ||
-            interpolationFrom_.worldMode != interpolationTo_.worldMode)
+            interpolationFrom_.worldMode !=
+                interpolationTo_.worldMode)
         {
-            renderedState.latitude = interpolationTo_.latitude;
-            renderedState.longitude = interpolationTo_.longitude;
-            renderedState.altitudeFeet = interpolationTo_.altitudeFeet;
-            renderedState.headingDegrees =
-                interpolationTo_.headingDegrees;
-            renderedState.pitchDegrees = interpolationTo_.pitchDegrees;
-            renderedState.rollDegrees = interpolationTo_.rollDegrees;
-            renderedState.gearRatio = interpolationTo_.gearRatio;
-            renderedState.flapRatio = interpolationTo_.flapRatio;
-            renderedState.thrustRatio = interpolationTo_.thrustRatio;
+            renderedState = interpolationTo_;
+
+            if (hasVelocityEstimate_ &&
+                interpolationTo_.worldMode)
+            {
+                const double extrapolationSeconds =
+                    std::clamp(
+                        nowSeconds -
+                            interpolationStartSeconds_,
+                        0.0,
+                        MAX_EXTRAPOLATION_SECONDS);
+
+                AdvanceWorldState(
+                    renderedState,
+                    velocityNorthMetresPerSecond_,
+                    velocityEastMetresPerSecond_,
+                    velocityVerticalFeetPerSecond_,
+                    extrapolationSeconds);
+            }
+
             return renderedState;
         }
 
-        const double progress = std::clamp(
+        const double rawProgress =
             (nowSeconds - interpolationStartSeconds_) /
-                interpolationDurationSeconds_,
-            0.0,
-            1.0);
+            interpolationDurationSeconds_;
+
+        const double progress =
+            std::clamp(
+                rawProgress,
+                0.0,
+                1.0);
 
         renderedState.latitude = InterpolateDouble(
             interpolationFrom_.latitude,
@@ -1835,6 +2339,16 @@ private:
         renderedState.altitudeFeet = InterpolateDouble(
             interpolationFrom_.altitudeFeet,
             interpolationTo_.altitudeFeet,
+            progress);
+
+        renderedState.groundSpeedKnots = InterpolateDouble(
+            interpolationFrom_.groundSpeedKnots,
+            interpolationTo_.groundSpeedKnots,
+            progress);
+
+        renderedState.verticalSpeedFpm = InterpolateDouble(
+            interpolationFrom_.verticalSpeedFpm,
+            interpolationTo_.verticalSpeedFpm,
             progress);
 
         renderedState.headingDegrees = InterpolateHeading(
@@ -1867,12 +2381,42 @@ private:
             interpolationTo_.thrustRatio,
             progress);
 
+        if (rawProgress > 1.0 &&
+            hasVelocityEstimate_ &&
+            interpolationTo_.worldMode)
+        {
+            const double extrapolationSeconds =
+                std::clamp(
+                    nowSeconds -
+                        (
+                            interpolationStartSeconds_ +
+                            interpolationDurationSeconds_
+                        ),
+                    0.0,
+                    MAX_EXTRAPOLATION_SECONDS);
+
+            AdvanceWorldState(
+                renderedState,
+                velocityNorthMetresPerSecond_,
+                velocityEastMetresPerSecond_,
+                velocityVerticalFeetPerSecond_,
+                extrapolationSeconds);
+        }
+
         return renderedState;
     }
 
     TrafficState state_;
     TrafficState interpolationFrom_;
     TrafficState interpolationTo_;
+    TrafficState lastAcceptedSnapshot_;
+
+    bool hasAcceptedSnapshot_ = false;
+    bool hasVelocityEstimate_ = false;
+
+    double velocityNorthMetresPerSecond_ = 0.0;
+    double velocityEastMetresPerSecond_ = 0.0;
+    double velocityVerticalFeetPerSecond_ = 0.0;
 
     double interpolationStartSeconds_ = 0.0;
     double interpolationDurationSeconds_ = 0.0;
@@ -2162,6 +2706,28 @@ namespace
             state.headingDegrees =
                 ParseFloat(value, state.headingDegrees);
 
+        else if (key == "ground_speed_kt" ||
+                 key == "ground_speed_knots")
+            state.groundSpeedKnots =
+                std::clamp(
+                    ParseDouble(
+                        value,
+                        state.groundSpeedKnots),
+                    0.0,
+                    1500.0);
+
+        else if (key == "vertical_speed_fpm")
+            state.verticalSpeedFpm =
+                std::clamp(
+                    ParseDouble(
+                        value,
+                        state.verticalSpeedFpm),
+                    -15000.0,
+                    15000.0);
+
+        else if (key == "last_seen_at")
+            state.lastSeenAt = Trim(value);
+
         else if (key == "pitch")
             state.pitchDegrees =
                 ParseFloat(value, state.pitchDegrees);
@@ -2220,6 +2786,17 @@ namespace
         state.registration = ToUpper(Trim(state.registration));
         state.flightNumber = ToUpper(Trim(state.flightNumber));
         state.labelText = Trim(state.labelText);
+        state.lastSeenAt = Trim(state.lastSeenAt);
+        state.groundSpeedKnots =
+            std::clamp(
+                state.groundSpeedKnots,
+                0.0,
+                1500.0);
+        state.verticalSpeedFpm =
+            std::clamp(
+                state.verticalSpeedFpm,
+                -15000.0,
+                15000.0);
         state.labelRed =
             std::clamp(state.labelRed, 0.0f, 1.0f);
         state.labelGreen =
