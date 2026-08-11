@@ -100,6 +100,7 @@ namespace
     std::string gResourcePath;
     std::string gCslConfigPath;
     std::string gBundledCslPath;
+    std::string gAeroPathModelsPath;
     std::string gConfiguredExternalCslPath;
     std::string gLoadedCslPath;
     std::size_t gLastReportedTrafficCount = static_cast<std::size_t>(-1);
@@ -986,8 +987,27 @@ namespace
         const CslValidationResult legacyValidation =
             ValidateCslFolder(gResourcePath);
 
+        const CslValidationResult aeroPathValidation =
+            ValidateCslFolder(gAeroPathModelsPath);
+
         if (legacyValidation.valid)
         {
+            /*
+             * Resources now contains AeroPathModels, which is loaded separately.
+             * If every xsb_aircraft.txt found under Resources belongs to that
+             * standalone catalogue, do not load Resources again or XPMP2 will
+             * see the same models twice.
+             */
+            if (aeroPathValidation.valid &&
+                legacyValidation.packageCount <=
+                    aeroPathValidation.packageCount)
+            {
+                LogMessage(
+                    "AeroPath Traffic: No separate legacy CSL packages found under Resources; standalone AeroPathModels already loaded");
+
+                return {};
+            }
+
             LogMessage(
                 "AeroPath Traffic: Bundled CSL subfolder was not found; loading legacy Resources root '%s' (%zu packages)",
                 gResourcePath.c_str(),
@@ -997,9 +1017,9 @@ namespace
         }
 
         LogMessage(
-            "AeroPath Traffic: No valid CSL packages were found. XPMP2 will still initialise, but remote aircraft models may be unavailable");
+            "AeroPath Traffic: No external, bundled or legacy CSL fallback packages were found; standalone AeroPathModels remain available");
 
-        return gResourcePath;
+        return {};
     }
 
     char* SafeCopy(
@@ -1241,7 +1261,8 @@ public:
         const bool modelChanged =
             state_.icaoType != acceptedState.icaoType ||
             state_.airline != acceptedState.airline ||
-            state_.livery != acceptedState.livery;
+            state_.livery != acceptedState.livery ||
+            state_.registration != acceptedState.registration;
 
         const bool identityChanged =
             modelChanged ||
@@ -1483,6 +1504,27 @@ public:
                    ToUpper(Trim(second));
         };
 
+        const auto modelSupportsLivery = [&sameCode](
+            const CSLModelInfo_t& modelInfo,
+            const std::string& requestedLivery)
+        {
+            if (Trim(requestedLivery).empty())
+                return false;
+
+            for (const CSLModelInfo_t::MatchCrit_t& criterion :
+                 modelInfo.vecMatchCrit)
+            {
+                if (sameCode(
+                        criterion.livery,
+                        requestedLivery))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
         const auto modelSupportsAirline = [&sameCode](
             const CSLModelInfo_t& modelInfo,
             const std::string& requestedAirline)
@@ -1549,6 +1591,52 @@ public:
 
         const bool airlineRequested =
             !Trim(state_.airline).empty();
+
+        /*
+         * AeroPath standalone multiplayer liveries use the remote registration
+         * as XPMP2's special-livery key. Try an exact registration match first.
+         * If no such AeroPath model exists, restore the normal airline/livery
+         * request and continue through the existing deterministic CSL policy.
+         */
+        const std::string registrationMatch =
+            ToUpper(Trim(state_.registration));
+
+        if (!registrationMatch.empty())
+        {
+            const int registrationQuality =
+                ChangeModel(
+                    state_.icaoType,
+                    "",
+                    registrationMatch);
+
+            const CSLModelInfo_t registrationModel =
+                GetModelInfo();
+
+            if (sameCode(
+                    registrationModel.icaoType,
+                    state_.icaoType) &&
+                modelSupportsLivery(
+                    registrationModel,
+                    registrationMatch))
+            {
+                SetRender(true);
+
+                LogMessage(
+                    "AeroPath Traffic: Exact registration livery accepted for '%s': %s/%s -> '%s' (quality %d)",
+                    state_.callsign.c_str(),
+                    state_.icaoType.c_str(),
+                    registrationMatch.c_str(),
+                    registrationModel.modelName.c_str(),
+                    registrationQuality);
+
+                return;
+            }
+
+            ChangeModel(
+                state_.icaoType,
+                state_.airline,
+                state_.livery);
+        }
 
         CSLModelInfo_t modelInfo = GetModelInfo();
         int selectedMatchQuality = GetMatchQuality();
@@ -3090,16 +3178,18 @@ namespace
                 const bool modelChanged =
                     previousState.icaoType != state.icaoType ||
                     previousState.airline != state.airline ||
-                    previousState.livery != state.livery;
+                    previousState.livery != state.livery ||
+                    previousState.registration != state.registration;
 
                 if (modelChanged)
                 {
                     LogMessage(
-                        "AeroPath Traffic: Model request for '%s' changed to %s/%s/%s",
+                        "AeroPath Traffic: Model request for '%s' changed to %s/%s/%s registration %s",
                         state.callsign.c_str(),
                         state.icaoType.c_str(),
                         state.airline.c_str(),
-                        state.livery.c_str());
+                        state.livery.c_str(),
+                        state.registration.c_str());
                 }
             }
             catch (const XPMP2::XPMP2Error& exception)
@@ -3627,6 +3717,10 @@ PLUGIN_API int XPluginEnable()
         JoinPath(
             gResourcePath,
             "CSL");
+    gAeroPathModelsPath =
+        JoinPath(
+            gResourcePath,
+            "AeroPathModels");
 
     gTrafficFilePath = resourcePath;
     gTrafficFilePath += pathSeparator;
@@ -3650,25 +3744,68 @@ PLUGIN_API int XPluginEnable()
         return 0;
     }
 
-    gLoadedCslPath =
-        ResolveCslFolderForStartup();
+    /*
+     * Load AeroPath's own lightweight multiplayer models independently from
+     * the user's external or bundled CSL library. XPMPLoadCSLPackage adds
+     * models to XPMP2's catalogue, so the two libraries can coexist.
+     */
+    const CslValidationResult aeroPathModelValidation =
+        ValidateCslFolder(
+            gAeroPathModelsPath);
 
-    result =
-        XPMPLoadCSLPackage(
-            gLoadedCslPath.c_str());
-
-    if (result[0])
+    if (aeroPathModelValidation.valid)
     {
-        LogMessage(
-            "AeroPath Traffic: CSL loading reported for '%s': %s",
-            gLoadedCslPath.c_str(),
-            result);
+        result =
+            XPMPLoadCSLPackage(
+                gAeroPathModelsPath.c_str());
+
+        if (result[0])
+        {
+            LogMessage(
+                "AeroPath Traffic: AeroPath model loading reported for '%s': %s",
+                gAeroPathModelsPath.c_str(),
+                result);
+        }
+        else
+        {
+            LogMessage(
+                "AeroPath Traffic: AeroPath multiplayer models loaded from '%s' (%zu packages)",
+                gAeroPathModelsPath.c_str(),
+                aeroPathModelValidation.packageCount);
+        }
     }
     else
     {
         LogMessage(
-            "AeroPath Traffic: CSL library loaded from '%s'",
-            gLoadedCslPath.c_str());
+            "AeroPath Traffic: No standalone AeroPath multiplayer models found at '%s': %s",
+            gAeroPathModelsPath.c_str(),
+            aeroPathModelValidation.message.c_str());
+    }
+
+    gLoadedCslPath =
+        ResolveCslFolderForStartup();
+
+    if (!gLoadedCslPath.empty() &&
+        std::filesystem::u8path(gLoadedCslPath).lexically_normal() !=
+            std::filesystem::u8path(gAeroPathModelsPath).lexically_normal())
+    {
+        result =
+            XPMPLoadCSLPackage(
+                gLoadedCslPath.c_str());
+
+        if (result[0])
+        {
+            LogMessage(
+                "AeroPath Traffic: CSL loading reported for '%s': %s",
+                gLoadedCslPath.c_str(),
+                result);
+        }
+        else
+        {
+            LogMessage(
+                "AeroPath Traffic: CSL fallback library loaded from '%s'",
+                gLoadedCslPath.c_str());
+        }
     }
 
     result =

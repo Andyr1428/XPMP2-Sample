@@ -1,0 +1,16 @@
+{
+  "package": "AeroPath_A319",
+  "version": "0.1.0-test",
+  "aircraft": "A319",
+  "engine": "IAE/V2500",
+  "wingtip": "standard",
+  "liveries": [
+    {
+      "registration": "G-SWXB",
+      "match": "A319 - G-SWXB",
+      "texture": "GSWXB.png"
+    }
+  ],
+  "publicDistribution": false,
+  "note": "Local multiplayer proof-of-concept only pending redistribution permission for the underlying model."
+}

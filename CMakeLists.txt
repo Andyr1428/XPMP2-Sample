@@ -29,7 +29,7 @@ else()
 endif()
 
 project(AeroPathTraffic
-        VERSION 3.1.3
+        VERSION 3.1.13
         DESCRIPTION "AeroPath multiplayer traffic plugin for X-Plane 12")
 
 message ("== Building: ${PROJECT_NAME} ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH} ==")
@@ -243,4 +243,22 @@ add_custom_command(
         "${AEROPATH_TAXI_GUIDANCE_SOURCE_DIR}/AeroPathTaxiLight.png"
         "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/TaxiGuidance/AeroPathTaxiLight.png"
     COMMENT "Copying AeroPath taxi-guidance resources"
+)
+
+################################################################################
+# AeroPath Standalone Multiplayer Models
+################################################################################
+
+set(AEROPATH_MODELS_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/AeroPathModels")
+
+add_custom_command(
+    TARGET AeroPathTraffic
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/AeroPathModels"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${AEROPATH_MODELS_SOURCE_DIR}"
+        "$<TARGET_FILE_DIR:AeroPathTraffic>/../Resources/AeroPathModels"
+    COMMENT "Copying AeroPath standalone multiplayer models"
 )
